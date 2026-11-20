@@ -160,7 +160,6 @@ th {
 .table-scroll,
 .winner-grid,
 .winner-book-content,
-.fixed-select,
 .prize-status-board {
   scrollbar-color: rgba(255, 201, 94, 0.82) rgba(92, 17, 10, 0.32);
   scrollbar-width: thin;
@@ -169,7 +168,6 @@ th {
 .table-scroll::-webkit-scrollbar,
 .winner-grid::-webkit-scrollbar,
 .winner-book-content::-webkit-scrollbar,
-.fixed-select::-webkit-scrollbar,
 .prize-status-board::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -178,7 +176,6 @@ th {
 .table-scroll::-webkit-scrollbar-track,
 .winner-grid::-webkit-scrollbar-track,
 .winner-book-content::-webkit-scrollbar-track,
-.fixed-select::-webkit-scrollbar-track,
 .prize-status-board::-webkit-scrollbar-track {
   border-radius: 999px;
   background: rgba(92, 17, 10, 0.14);
@@ -187,7 +184,6 @@ th {
 .table-scroll::-webkit-scrollbar-thumb,
 .winner-grid::-webkit-scrollbar-thumb,
 .winner-book-content::-webkit-scrollbar-thumb,
-.fixed-select::-webkit-scrollbar-thumb,
 .prize-status-board::-webkit-scrollbar-thumb {
   border: 2px solid rgba(92, 17, 10, 0.14);
   border-radius: 999px;
@@ -381,19 +377,10 @@ th {
   display: none;
 }
 
-.draggable {
+.screen-logo,
+.qr-card {
   position: absolute;
   z-index: 28;
-  cursor: grab;
-  user-select: none;
-  touch-action: none;
-  -webkit-user-select: none;
-}
-
-.draggable.is-dragging {
-  z-index: 90;
-  cursor: grabbing;
-  transition: none;
 }
 
 .screen-logo {
@@ -428,31 +415,6 @@ th {
   text-align: center;
 }
 
-.qr-card.is-dragging {
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.34), 0 0 0 3px rgba(255, 226, 138, 0.42);
-}
-
-.qr-card.is-resizing {
-  z-index: 92;
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.34), 0 0 0 3px rgba(255, 226, 138, 0.46);
-}
-
-.qr-card::before {
-  content: "";
-  position: absolute;
-  inset: -4px;
-  border: 1px dashed rgba(255, 255, 255, 0.68);
-  border-radius: 10px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.16s ease;
-}
-
-.qr-card:hover::before,
-.qr-card:active::before {
-  opacity: 1;
-}
-
 .qr-card img {
   width: calc(var(--qr-size, 106px) - 18px);
   height: calc(var(--qr-size, 106px) - 18px);
@@ -473,64 +435,6 @@ th {
   margin-top: 3px;
   color: #9a3412;
   font-size: clamp(10px, calc(var(--qr-size, 106px) / 12), 15px);
-}
-
-.qr-resize-handle {
-  position: absolute;
-  right: -8px;
-  bottom: -8px;
-  width: 22px;
-  height: 22px;
-  min-height: 22px;
-  padding: 0;
-  border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.95);
-  background: linear-gradient(135deg, #ffe7a3, #df8d16);
-  box-shadow: 0 5px 14px rgba(77, 18, 6, 0.36);
-  cursor: nwse-resize;
-}
-
-.qr-resize-handle::before {
-  content: "";
-  position: absolute;
-  right: 5px;
-  bottom: 5px;
-  width: 8px;
-  height: 8px;
-  border-right: 2px solid #7a210a;
-  border-bottom: 2px solid #7a210a;
-}
-
-.qr-size-controls {
-  position: absolute;
-  left: 50%;
-  bottom: -32px;
-  display: flex;
-  gap: 6px;
-  opacity: 1;
-  transform: translateX(-50%);
-  transition: opacity 0.16s ease, transform 0.16s ease;
-}
-
-.qr-card:hover .qr-size-controls,
-.qr-card:focus-within .qr-size-controls,
-.qr-card.is-resizing .qr-size-controls {
-  opacity: 1;
-  transform: translateX(-50%);
-}
-
-.qr-size-step {
-  width: 28px;
-  height: 24px;
-  min-height: 24px;
-  padding: 0;
-  border-radius: 6px;
-  color: #6d1b15;
-  background: linear-gradient(180deg, #fff1bd, #e7a22e);
-  box-shadow: 0 6px 14px rgba(77, 18, 6, 0.28);
-  font-size: 16px;
-  font-weight: 800;
-  line-height: 1;
 }
 
 .screen-main {
@@ -1894,12 +1798,97 @@ th {
   object-fit: cover;
 }
 
-.fixed-select {
-  min-height: 120px;
-  max-height: 220px;
+.settings-page {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+.settings-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.settings-header h1 {
+  margin: 0;
+  color: #7f1d1d;
+  font-size: 24px;
+}
+
+.settings-layout,
+.fixed-winner-editor {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 10px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.settings-layout legend,
+.fixed-winner-editor legend {
+  padding: 0 8px 0 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.settings-layout > .grid-3 {
+  margin-top: 12px;
+}
+
+.fixed-winner-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.fixed-winner-add select {
+  min-width: 0;
+}
+
+.fixed-winner-add button {
+  white-space: nowrap;
+}
+
+.fixed-winner-editor svg {
+  width: 16px;
+  height: 16px;
+}
+
+.fixed-winner-list {
+  display: grid;
+  gap: 4px;
+  max-height: 180px;
+  margin: 8px 0 0;
+  padding: 0;
   overflow: auto;
-  scrollbar-gutter: stable;
-  -webkit-overflow-scrolling: touch;
+  list-style: none;
+}
+
+.fixed-winner-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.fixed-winner-list .icon-button {
+  flex: 0 0 32px;
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+}
+
+.fixed-winner-empty {
+  margin: 8px 0 0;
+  font-size: 13px;
 }
 
 .mobile-title {
@@ -1966,6 +1955,10 @@ th {
   justify-items: center;
   align-items: center;
   gap: 8px;
+}
+
+.checkin-avatar-field.is-wechat {
+  grid-template-rows: 108px 20px;
 }
 
 .checkin-avatar-preview {
@@ -2761,11 +2754,6 @@ th {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.68), 0 8px 0 #9d3a05, 0 15px 26px rgba(60, 8, 3, 0.34);
 }
 
-.qr-size-controls {
-  opacity: 0;
-  transform: translateX(-50%) translateY(4px);
-}
-
 .draw-stop-button {
   display: none;
 }
@@ -3322,6 +3310,26 @@ th {
   align-items: center;
   gap: 8px;
   color: #fff3db;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .checkin-arrival {
+    animation: checkin-list-in 420ms ease-out both;
+  }
+
+  tr.checkin-arrival td {
+    animation: checkin-row-highlight 1200ms ease-out;
+  }
+}
+
+@keyframes checkin-list-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes checkin-row-highlight {
+  from { background-color: #fff0c8; }
+  to { background-color: transparent; }
 }
 
 .recent-checkin-item img {

@@ -5,18 +5,29 @@ import { after, before, test } from 'node:test';
 import { startTestServer } from './helpers/test-server.js';
 
 let server;
+let adminCookie;
 before(async () => {
   server = await startTestServer({ env: {
     WECHAT_APP_ID: 'test-app-id', WECHAT_APP_SECRET: 'test-secret', PUBLIC_URL: 'https://event.example.test'
   } });
+  adminCookie = await login('admin');
 });
 after(async () => { await server?.stop(); });
 
-async function json(url, body, method = 'POST') {
+async function json(url, body, method = 'POST', cookie) {
   const response = await fetch(server.url + url, {
-    method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    method, headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify(body)
   });
   return { status: response.status, body: await response.json() };
+}
+
+async function login(role) {
+  const response = await fetch(server.url + '/api/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role, password: role === 'admin' ? 'admin123' : 'screen123' })
+  });
+  assert.equal(response.status, 200);
+  return response.headers.getSetCookie()[0].split(';')[0];
 }
 
 async function state() {
@@ -127,17 +138,17 @@ test('local sign-in rejects missing, external and executable avatar URLs', async
 });
 
 test('WeChat authorization is still available as an explicit mode', async () => {
-  await json('/api/config', { checkinMode: 'wechat' }, 'PUT');
+  assert.equal((await json('/api/config', { checkinMode: 'wechat' }, 'PUT', adminCookie)).status, 200);
   const response = await fetch(server.url + '/checkin', { headers: { 'User-Agent': 'MicroMessenger/8.0' }, redirect: 'manual' });
   assert.equal(response.status, 302);
   assert.equal(response.headers.get('location'), '/wechat/oauth/start');
-  await json('/api/config', { checkinMode: 'local' }, 'PUT');
+  await json('/api/config', { checkinMode: 'local' }, 'PUT', adminCookie);
 });
 
 test('local attendees can enter the draw and be exported without a phone', async () => {
   const guest = await json('/api/checkin', { visitorId: 'draw-guest', name: '抽奖来宾', source: 'local-form' });
   const id = guest.body.attendee.id;
-  await json('/api/prizes/grand-prize', { fixedWinnerIds: [id] }, 'PUT');
+  assert.equal((await json('/api/prizes/grand-prize/fixed-winners', { attendeeId: id }, 'POST', adminCookie)).status, 200);
   const result = await json('/api/draw', { prizeId: 'grand-prize', count: 1 });
   assert.equal(result.status, 200);
   assert.equal(result.body.winners[0].attendeeId, id);
@@ -145,4 +156,44 @@ test('local attendees can enter the draw and be exported without a phone', async
   const exported = await fetch(server.url + '/api/export/checkins.xlsx');
   assert.equal(exported.status, 200);
   assert.ok((await exported.arrayBuffer()).byteLength > 100);
+});
+
+test('only an authenticated administrator can save display settings on the LAN', async () => {
+  const screenCookie = await login('screen');
+  assert.equal((await json('/api/config', { qrSize: 140 }, 'PUT')).status, 401);
+  assert.equal((await json('/api/config', { qrSize: 140 }, 'PUT', screenCookie)).status, 403);
+  const result = await json('/api/config', { qrSize: 140, qrPosition: { x: 860, y: 36 } }, 'PUT', adminCookie);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.config.qrSize, 140);
+  assert.deepEqual(result.body.config.qrPosition, { x: 860, y: 36 });
+});
+
+test('signing in and saving a prize never adds presets; explicit additions and removals stay scoped to that prize', async () => {
+  const guest = await json('/api/checkin', { visitorId: 'manual-presets', name: '待选签到来宾' });
+  const id = guest.body.attendee.id;
+  const created = await json('/api/prizes', { name: '测试奖项', quantity: 3, fixedWinnerIds: [id] });
+  assert.deepEqual(created.body.fixedWinnerIds, []);
+  const route = `/api/prizes/${created.body.id}`;
+  const fixed = `${route}/fixed-winners`;
+  assert.equal((await json(fixed, { attendeeId: id })).status, 401);
+  assert.equal((await json(fixed, { attendeeId: 'missing' }, 'POST', adminCookie)).status, 404);
+  const updated = await json(route, { name: '改名后的奖项', fixedWinnerIds: [id] }, 'PUT', adminCookie);
+  assert.deepEqual(updated.body.fixedWinnerIds, []);
+
+  for (let repeat = 0; repeat < 2; repeat += 1) {
+    const added = await json(fixed, { attendeeId: id }, 'POST', adminCookie);
+    assert.deepEqual(added.body.fixedWinnerIds, [id]);
+  }
+  assert.equal((await state()).prizes.find((prize) => prize.id === 'second-prize').fixedWinnerIds.length, 0);
+  const saved = await json(route, { quantity: 2, fixedWinnerIds: [] }, 'PUT', adminCookie);
+  assert.deepEqual(saved.body.fixedWinnerIds, [id]);
+  const removed = await json(`${fixed}/${id}`, undefined, 'DELETE', adminCookie);
+  assert.deepEqual(removed.body.fixedWinnerIds, []);
+  const draw = await json('/api/draw', { prizeId: created.body.id, count: 1 });
+  assert.equal(draw.body.winners[0].fixed, false);
+  assert.ok((await state()).attendees.some((attendee) => attendee.id === id));
+
+  await json(fixed, { attendeeId: id }, 'POST', adminCookie);
+  await json(`/api/attendees/${id}`, undefined, 'DELETE', adminCookie);
+  assert.deepEqual((await state()).prizes.find((prize) => prize.id === created.body.id).fixedWinnerIds, []);
 });

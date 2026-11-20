@@ -10,6 +10,8 @@ import multer from 'multer';
 import QRCode from 'qrcode';
 import { Server } from 'socket.io';
 import writeExcelFile from 'write-excel-file/node';
+import { createPublicAccess, createStaffSessions } from './public-access.js';
+import { createWechatCheckin } from './wechat-checkin.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,17 +22,57 @@ const DATA_FILE = path.join(DATA_DIR, 'store.json');
 const EXAMPLE_DATA_FILE = path.join(DATA_DIR, 'store.example.json');
 const UPLOAD_DIR = path.join(ROOT_DIR, 'assets', 'uploads');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const avatarFilePattern = /^avatar-(?:public-[a-f0-9]{64}-)?[a-f0-9-]+\.(jpg|png|webp|gif)$/;
 
 loadEnvFile(ENV_FILE);
 
 const PORT = Number(process.env.PORT || 3000);
+const publicAccess = createPublicAccess(process.env);
+const staffAccess = publicAccess || createStaffSessions({ secure: false });
+const publicWechat = publicAccess && createWechatCheckin({
+  origin: publicAccess.origin, env: process.env, fetchJson: fetchWechatJson
+});
+const HOST = publicAccess ? '127.0.0.1' : '0.0.0.0';
+const qrOptions = { type: 'svg', width: 420, margin: 1, errorCorrectionLevel: 'M' };
+const publicCheckinQr = publicAccess ? await QRCode.toString(`${publicAccess.origin}/checkin`, qrOptions) : null;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, publicAccess ? {
+  allowRequest(req, callback) {
+    const origin = req.headers.origin;
+    callback(null, Boolean(publicAccess.session(req) && (!origin || origin === publicAccess.origin)));
+  }
+} : {});
+
+if (publicAccess) {
+  app.disable('x-powered-by');
+  // Public mode only listens on loopback, behind a single local reverse proxy.
+  app.set('trust proxy', 1);
+  app.use((req, res, next) => {
+    res.set({
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'same-origin',
+      'X-Frame-Options': 'DENY'
+    });
+    next();
+  });
+  app.use('/api', publicAccess.guardApi);
+  app.use('/uploads', (req, res, next) => {
+    res.set({
+      'Cache-Control': 'private, no-store',
+      'Content-Security-Policy': "default-src 'none'; sandbox"
+    });
+    if (!publicAccess.session(req)) {
+      res.sendStatus(404);
+      return;
+    }
+    next();
+  });
+}
 
 app.use(express.json({ limit: '8mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -55,7 +97,7 @@ const upload = multer({
 
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024, files: 1 }
+  limits: { fileSize: 2 * 1024 * 1024, files: 1, fields: 0, parts: 2 }
 });
 
 function avatarExtension(buffer) {
@@ -99,10 +141,17 @@ function saveStore(store) {
 
 function normalizeStore(store) {
   const defaults = JSON.parse(fs.readFileSync(EXAMPLE_DATA_FILE, 'utf8'));
+  const attendees = Array.isArray(store.attendees) ? store.attendees : [];
+  const attendeeIds = new Set(attendees.map((attendee) => attendee.id));
+  const prizes = Array.isArray(store.prizes) ? store.prizes : defaults.prizes;
   return {
     config: { ...defaults.config, ...(store.config || {}) },
-    attendees: Array.isArray(store.attendees) ? store.attendees : [],
-    prizes: Array.isArray(store.prizes) ? store.prizes : defaults.prizes,
+    attendees,
+    prizes: prizes.map((prize) => ({
+      ...prize,
+      fixedWinnerIds: Array.isArray(prize.fixedWinnerIds)
+        ? [...new Set(prize.fixedWinnerIds.filter((id) => attendeeIds.has(id)))] : []
+    })),
     winners: Array.isArray(store.winners) ? store.winners : []
   };
 }
@@ -136,6 +185,26 @@ function publicConfig(config) {
 }
 
 function publicState(req, store = loadStore()) {
+  if (publicAccess) {
+    const role = publicAccess.session(req)?.role;
+    const config = { ...publicConfig(store.config), checkinMode: 'wechat' };
+    const profile = publicWechat.profile(req);
+    const self = profile && store.attendees.find((attendee) => attendee.openid === profile.id);
+    return {
+      deployment: 'public',
+      accessRole: role || null,
+      config: role ? config : { eventTitle: config.eventTitle, subtitle: config.subtitle, checkinMode: 'wechat' },
+      attendees: role === 'admin' ? store.attendees : role === 'screen' ? store.attendees.map(screenAttendee) : [],
+      prizes: role === 'admin' ? store.prizes : role === 'screen' ? store.prizes.map(screenPrize) : [],
+      winners: role === 'admin' ? store.winners : role === 'screen' ? store.winners.map(screenWinner) : [],
+      selfAttendee: self ? screenAttendee(self) : null,
+      wechat: {
+        ready: publicWechat.ready,
+        profile: profile ? { nickname: profile.nickname, avatar: profile.avatar } : null
+      },
+      checkinUrl: `${publicAccess.origin}/checkin`
+    };
+  }
   return {
     config: publicConfig(store.config),
     attendees: store.attendees,
@@ -150,7 +219,20 @@ function publicState(req, store = loadStore()) {
   };
 }
 
+function screenAttendee({ id, name, nickname, company, avatar, checkedInAt }) {
+  return { id, name, nickname, company, avatar, checkedInAt };
+}
+
+function screenPrize({ fixedWinnerIds, ...prize }) {
+  return prize;
+}
+
+function screenWinner({ phone, fixed, ...winner }) {
+  return winner;
+}
+
 function baseUrl(req) {
+  if (publicAccess) return publicAccess.origin;
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '');
   const host = req.get('host');
   if (/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host || '')) {
@@ -161,6 +243,18 @@ function baseUrl(req) {
 }
 
 function emitState(req, eventName, payload) {
+  if (publicAccess) {
+    const store = loadStore();
+    for (const socket of io.sockets.sockets.values()) {
+      if (!publicAccess.session(socket.request)) {
+        socket.disconnect(true);
+        continue;
+      }
+      socket.emit('state', publicState(socket.request, store));
+      if (eventName === 'checkin:new') socket.emit(eventName, screenAttendee(payload));
+    }
+    return;
+  }
   const state = publicState(req);
   io.emit('state', state);
   if (eventName) io.emit(eventName, payload);
@@ -265,12 +359,12 @@ function saveWechatAttendee(req, userInfo) {
   if (existing) Object.assign(existing, attendee);
   else store.attendees.push(attendee);
   saveStore(store);
-  emitState(req, 'checkin:new', existing || attendee);
+  emitState(req, existing ? null : 'checkin:new', attendee);
   return existing || attendee;
 }
 
 async function fetchWechatJson(url) {
-  const response = await fetch(url);
+  const response = await fetch(url, { signal: AbortSignal.timeout(8000), redirect: 'error' });
   const data = await response.json();
   if (!response.ok || data.errcode) {
     throw new Error(data.errmsg || `微信接口请求失败：${response.status}`);
@@ -317,29 +411,34 @@ async function sendWorkbook(res, filename, rows, columns) {
 }
 
 app.get('/api/state', (req, res) => {
-  res.json(publicState(req));
+  res.set('Cache-Control', 'no-store');
+  res.json({ ...publicState(req), accessRole: staffAccess.session(req)?.role || null });
 });
 
 app.post('/api/login', (req, res) => {
-  const store = loadStore();
-  const role = req.body.role === 'screen' ? 'screen' : 'admin';
-  const expected = role === 'admin' ? store.config.adminPassword : store.config.screenPassword;
-  if (cleanText(req.body.password, 80) !== expected) {
+  const { role: requestedRole, password } = req.body || {};
+  const role = requestedRole === 'screen' ? 'screen' : 'admin';
+  const valid = publicAccess ? publicAccess.matchesPassword(role, password)
+    : cleanText(password, 80) === loadStore().config[role === 'admin' ? 'adminPassword' : 'screenPassword'];
+  if (!valid) {
     res.status(401).json({ message: '密码不正确' });
     return;
   }
+  const previousSession = staffAccess.endSession(req);
+  if (publicAccess && previousSession) io.in(previousSession).disconnectSockets(true);
+  staffAccess.startSession(res, role);
   res.json({ ok: true, role, path: role === 'admin' ? '/admin' : '/screen/checkin' });
+});
+
+app.post('/api/logout', (req, res) => {
+  const id = staffAccess.endSession(req, res);
+  if (publicAccess && id) io.in(id).disconnectSockets(true);
+  res.json({ ok: true });
 });
 
 app.get('/api/qrcode.svg', async (req, res, next) => {
   try {
-    const target = cleanText(req.query.target, 500) || `${baseUrl(req)}/checkin`;
-    const svg = await QRCode.toString(target, {
-      type: 'svg',
-      width: 420,
-      margin: 1,
-      errorCorrectionLevel: 'M'
-    });
+    const svg = publicCheckinQr ?? await QRCode.toString(cleanText(req.query.target, 500) || `${baseUrl(req)}/checkin`, qrOptions);
     res.type('image/svg+xml').send(svg);
   } catch (error) {
     next(error);
@@ -347,6 +446,11 @@ app.get('/api/qrcode.svg', async (req, res, next) => {
 });
 
 app.get('/wechat/oauth/start', (req, res) => {
+  if (publicWechat) {
+    if (!isWechatBrowser(req)) return res.redirect('/checkin?wechat=outside');
+    if (!publicAccess.allowWechatStart(req, res)) return;
+    return publicWechat.start(req, res);
+  }
   const config = getWechatOAuthConfig(req);
   if (!config.ready) {
     res.redirect('/checkin?wechat=not-ready');
@@ -363,6 +467,7 @@ app.get('/wechat/oauth/start', (req, res) => {
 });
 
 app.get('/wechat/oauth/callback', async (req, res, next) => {
+  if (publicWechat) return publicWechat.callback(req, res);
   try {
     const config = getWechatOAuthConfig(req);
     const code = cleanText(req.query.code, 180);
@@ -398,6 +503,13 @@ app.get('/wechat/oauth/callback', async (req, res, next) => {
 });
 
 app.get('/checkin', (req, res, next) => {
+  if (publicWechat) {
+    res.set('Cache-Control', 'no-store');
+    if (req.method === 'GET' && publicWechat.ready && !req.query.wechat && isWechatBrowser(req) && !publicWechat.profile(req)) {
+      return res.redirect('/wechat/oauth/start');
+    }
+    return next();
+  }
   const config = getWechatOAuthConfig(req);
   if (loadStore().config.checkinMode === 'wechat' && !req.query.checked && config.ready && (isWechatBrowser(req) || req.query.oauth === '1')) {
     res.redirect('/wechat/oauth/start');
@@ -406,16 +518,32 @@ app.get('/checkin', (req, res, next) => {
   next();
 });
 
-app.put('/api/config', (req, res) => {
+function requireAdminSession(req, res, next) {
+  res.set('Cache-Control', 'no-store');
+  const role = staffAccess.session(req)?.role;
+  if (role !== 'admin') {
+    res.status(role ? 403 : 401).json({ message: '请使用后台密码登录' });
+    return;
+  }
+  const origin = req.get('origin');
+  if (!publicAccess && origin && origin !== `${req.protocol}://${req.get('host')}`) {
+    res.status(403).json({ message: '请从活动页面发起请求' });
+    return;
+  }
+  next();
+}
+
+app.put('/api/config', requireAdminSession, (req, res) => {
   const store = loadStore();
   const body = req.body || {};
-  const next = { ...store.config };
+  const previous = store.config;
+  const next = { ...previous };
   if ('eventTitle' in body) next.eventTitle = cleanText(body.eventTitle, 80) || next.eventTitle;
   if ('subtitle' in body) next.subtitle = cleanText(body.subtitle, 120);
   if ('logoUrl' in body) next.logoUrl = cleanText(body.logoUrl, 500);
   if ('musicUrl' in body) next.musicUrl = cleanText(body.musicUrl, 500);
   if ('theme' in body) next.theme = cleanText(body.theme, 40) || 'celebration';
-  if (['local', 'wechat'].includes(body.checkinMode)) next.checkinMode = body.checkinMode;
+  if (!publicAccess && ['local', 'wechat'].includes(body.checkinMode)) next.checkinMode = body.checkinMode;
   if ('wallMode' in body) next.wallMode = ['orbit', 'sphere', 'wall', 'text'].includes(body.wallMode) ? body.wallMode : next.wallMode;
   if ('wallText' in body) next.wallText = cleanText(body.wallText, 16) || 'LUCKY';
   if ('allowRepeatWinners' in body) next.allowRepeatWinners = Boolean(body.allowRepeatWinners);
@@ -425,15 +553,28 @@ app.put('/api/config', (req, res) => {
   if ('logoPosition' in body) next.logoPosition = safePosition(body.logoPosition, next.logoPosition);
   if ('qrPosition' in body) next.qrPosition = safePosition(body.qrPosition, next.qrPosition);
   if ('qrSize' in body) next.qrSize = safeNumber(body.qrSize, next.qrSize || 106, 88, 280);
-  if (cleanText(body.adminPassword, 80)) next.adminPassword = cleanText(body.adminPassword, 80);
-  if (cleanText(body.screenPassword, 80)) next.screenPassword = cleanText(body.screenPassword, 80);
+  if (!publicAccess && cleanText(body.adminPassword, 80)) next.adminPassword = cleanText(body.adminPassword, 80);
+  if (!publicAccess && cleanText(body.screenPassword, 80)) next.screenPassword = cleanText(body.screenPassword, 80);
   store.config = next;
   saveStore(store);
+  if (!publicAccess) {
+    if (next.screenPassword !== previous.screenPassword) staffAccess.endRoleSessions('screen');
+    if (next.adminPassword !== previous.adminPassword) {
+      staffAccess.endRoleSessions('admin');
+      staffAccess.startSession(res, 'admin');
+    }
+  }
   emitState(req, 'config:update', publicConfig(next));
   res.json(publicState(req, store));
 });
 
-app.post('/api/upload/:kind', upload.single('file'), (req, res) => {
+app.post('/api/upload/:kind', (req, res, next) => {
+  if (publicAccess && !['logo', 'music', 'prize'].includes(req.params.kind)) {
+    res.status(400).json({ message: '不支持的上传类型' });
+    return;
+  }
+  next();
+}, upload.single('file'), (req, res) => {
   if (!req.file) {
     res.status(400).json({ message: '没有收到文件' });
     return;
@@ -467,21 +608,27 @@ app.post('/api/checkin/avatar', (req, res, next) => {
 });
 
 app.post('/api/checkin', (req, res) => {
+  const profile = publicWechat?.profile(req);
+  if (publicWechat && !profile) {
+    res.status(401).json({ message: '请重新授权微信后签到' });
+    return;
+  }
   const store = loadStore();
   const now = new Date().toISOString();
   const body = req.body || {};
-  const openid = cleanText(body.openid, 160) || cleanText(body.visitorId, 160) || `local-${crypto.randomUUID()}`;
-  const phone = cleanPhone(body.phone);
-  const name = cleanText(body.name, 40);
+  const name = cleanText(profile && typeof body.name !== 'string' ? '' : body.name, 40);
   if (!name) {
     res.status(400).json({ message: '请填写姓名' });
     return;
   }
+  const openid = profile?.id || cleanText(body.openid, 160) || cleanText(body.visitorId, 160) || `local-${crypto.randomUUID()}`;
+  const phone = profile ? '' : cleanPhone(body.phone);
   const existing = store.attendees.find((item) => item.openid === openid || (phone && item.phone === phone));
-  const source = cleanText(body.source, 30) || 'local-form';
-  let avatar = cleanText(body.avatar, 5000);
+  const source = profile ? 'wechat-oauth' : cleanText(body.source, 30) || 'local-form';
+  let avatar = profile ? profile.avatar : cleanText(body.avatar, 5000);
   if (source === 'local-form' && avatar) {
-    if (!/^\/uploads\/avatar-[a-f0-9-]+\.(jpg|png|webp|gif)$/.test(avatar) || !fs.existsSync(path.join(UPLOAD_DIR, path.basename(avatar)))) {
+    const filename = avatar.slice('/uploads/'.length);
+    if (!avatar.startsWith('/uploads/') || !avatarFilePattern.test(filename) || !fs.existsSync(path.join(UPLOAD_DIR, filename))) {
       res.status(400).json({ message: '头像文件无效，请重新上传' });
       return;
     }
@@ -490,11 +637,11 @@ app.post('/api/checkin', (req, res) => {
   const attendee = {
     id: crypto.randomUUID(),
     openid,
-    nickname: cleanText(body.nickname, 60) || name,
+    nickname: (profile ? cleanText(profile.nickname, 60) : cleanText(body.nickname, 60)) || name,
     avatar,
     name,
-    company: body.company === undefined ? existing?.company || '' : cleanText(body.company, 80),
-    phone: body.phone === undefined ? existing?.phone || '' : phone,
+    company: profile ? '' : body.company === undefined ? existing?.company || '' : cleanText(body.company, 80),
+    phone: !profile && body.phone === undefined ? existing?.phone || '' : phone,
     source,
     checkedInAt: now
   };
@@ -507,8 +654,8 @@ app.post('/api/checkin', (req, res) => {
     saved = attendee;
   }
   saveStore(store);
-  emitState(req, 'checkin:new', saved);
-  res.json({ ok: true, attendee: saved, existing: Boolean(existing) });
+  emitState(req, existing ? null : 'checkin:new', saved);
+  res.json({ ok: true, attendee: publicAccess ? screenAttendee(saved) : saved, existing: Boolean(existing) });
 });
 
 app.get('/api/attendees', (req, res) => {
@@ -548,7 +695,7 @@ app.post('/api/prizes', (req, res) => {
     drawCount: Math.max(1, Number.parseInt(req.body.drawCount, 10) || 1),
     imageUrl: cleanText(req.body.imageUrl, 500),
     animation: ['orbit', 'sphere', 'wall', 'text'].includes(req.body.animation) ? req.body.animation : 'sphere',
-    fixedWinnerIds: Array.isArray(req.body.fixedWinnerIds) ? req.body.fixedWinnerIds : []
+    fixedWinnerIds: []
   };
   store.prizes.push(prize);
   saveStore(store);
@@ -568,14 +715,31 @@ app.put('/api/prizes/:id', (req, res) => {
   if ('drawCount' in req.body) prize.drawCount = Math.max(1, Number.parseInt(req.body.drawCount, 10) || prize.drawCount);
   if ('imageUrl' in req.body) prize.imageUrl = cleanText(req.body.imageUrl, 500);
   if ('animation' in req.body) prize.animation = ['orbit', 'sphere', 'wall', 'text'].includes(req.body.animation) ? req.body.animation : prize.animation;
-  if ('fixedWinnerIds' in req.body && Array.isArray(req.body.fixedWinnerIds)) {
-    const attendeeIds = new Set(store.attendees.map((item) => item.id));
-    prize.fixedWinnerIds = req.body.fixedWinnerIds.filter((id) => attendeeIds.has(id));
-  }
   saveStore(store);
   emitState(req, 'prize:update', prize);
   res.json(prize);
 });
+
+function updateFixedWinners(req, res, add) {
+  const store = loadStore();
+  const prize = store.prizes.find((item) => item.id === req.params.id);
+  if (!prize) return res.status(404).json({ message: '奖项不存在' });
+  const attendeeId = add ? req.body?.attendeeId : req.params.attendeeId;
+  if (add) {
+    if (!store.attendees.some((attendee) => attendee.id === attendeeId)) {
+      return res.status(404).json({ message: '签到人员不存在' });
+    }
+    if (!prize.fixedWinnerIds.includes(attendeeId)) prize.fixedWinnerIds.push(attendeeId);
+  } else {
+    prize.fixedWinnerIds = prize.fixedWinnerIds.filter((id) => id !== attendeeId);
+  }
+  saveStore(store);
+  emitState(req, 'prize:update', prize);
+  res.json({ fixedWinnerIds: prize.fixedWinnerIds });
+}
+
+app.post('/api/prizes/:id/fixed-winners', requireAdminSession, (req, res) => updateFixedWinners(req, res, true));
+app.delete('/api/prizes/:id/fixed-winners/:attendeeId', requireAdminSession, (req, res) => updateFixedWinners(req, res, false));
 
 app.delete('/api/prizes/:id', (req, res) => {
   const store = loadStore();
@@ -635,7 +799,12 @@ app.post('/api/draw', (req, res) => {
   store.winners.push(...winners);
   saveStore(store);
   emitState(req, 'draw:complete', { prize, winners });
-  res.json({ prize, winners, remaining: remainingPrizeCount(store, prize) });
+  const isScreen = publicAccess?.session(req)?.role === 'screen';
+  res.json({
+    prize: isScreen ? screenPrize(prize) : prize,
+    winners: isScreen ? winners.map(screenWinner) : winners,
+    remaining: remainingPrizeCount(store, prize)
+  });
 });
 
 app.get('/api/winners', (req, res) => {
@@ -724,6 +893,18 @@ function formatDate(value) {
 }
 
 io.on('connection', (socket) => {
+  if (publicAccess) {
+    const session = publicAccess.session(socket.request);
+    if (!session) {
+      socket.disconnect(true);
+      return;
+    }
+    socket.join(session.id);
+    const expiry = setTimeout(() => socket.disconnect(true), session.expiresAt - Date.now());
+    socket.on('disconnect', () => clearTimeout(expiry));
+    socket.emit('state', publicState(socket.request));
+    return;
+  }
   socket.emit('state', publicState({
     protocol: 'http',
     get: () => `localhost:${PORT}`
@@ -735,13 +916,18 @@ app.get(/.*/, (req, res) => {
 });
 
 app.use((error, req, res, next) => {
+  if (publicAccess && (error.status === 400 || error.status === 413)) {
+    res.status(error.status).json({ message: error.status === 413 ? '请求内容过大' : '请求格式有误' });
+    return;
+  }
   console.error(error);
-  res.status(500).json({ message: error.message || '服务异常' });
+  res.status(500).json({ message: publicAccess ? '服务异常' : error.message || '服务异常' });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, HOST, () => {
   console.log(`微信签到抽奖服务已启动：http://localhost:${PORT}`);
-  for (const address of lanUrls(PORT)) {
+  if (publicAccess) console.log(`公网部署模式：${publicAccess.origin}（由本机 HTTPS 代理转发）`);
+  for (const address of publicAccess ? [] : lanUrls(PORT)) {
     console.log(`局域网访问：${address}`);
   }
 });

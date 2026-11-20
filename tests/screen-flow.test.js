@@ -10,12 +10,14 @@ function browser(pathname = '/screen/lottery') {
   const app = { innerHTML: '' };
   const masks = [];
   const selectors = new Map([['#app', app]]);
+  const events = new Map();
   const timers = [];
   const stopLabel = { textContent: '' };
   selectors.set('#screenPrize', { value: 'first', addEventListener() {} });
   selectors.set('#screenCount', { value: '2' });
   selectors.set('#drawStopButton', { querySelector: () => stopLabel, addEventListener() {} });
   selectors.set('#drawLiveStatus', { textContent: '' });
+  selectors.set('#loginForm', { addEventListener() {} });
   const context = vm.createContext({
     document: {
       querySelector: (selector) => selectors.get(selector) || null,
@@ -33,12 +35,13 @@ function browser(pathname = '/screen/lottery') {
       setInterval: (fn) => timers.push(fn),
       clearInterval() {}
     },
-    sessionStorage: { getItem: () => 'screen' },
+    io: () => ({ on: (event, callback) => events.set(event, callback) }),
     CSS: { escape: (value) => value },
     btoa: (value) => Buffer.from(value, 'binary').toString('base64')
   });
   vm.runInContext(source, context);
   vm.runInContext(`state = {
+    accessRole: 'screen',
     config: {},
     attendees: [{ id: 'a', name: '嘉宾甲' }, { id: 'b', name: '嘉宾乙' }, { id: 'c', name: '嘉宾丙' }],
     prizes: [
@@ -48,7 +51,7 @@ function browser(pathname = '/screen/lottery') {
     ],
     winners: [], checkinUrl: 'http://example.test/checkin'
   };`, context);
-  return { context, app, masks, selectors, timers, run: (code) => vm.runInContext(code, context) };
+  return { context, app, masks, selectors, timers, events, run: (code) => vm.runInContext(code, context) };
 }
 
 test('check-in and lottery have independent display routes', () => {
@@ -57,6 +60,7 @@ test('check-in and lottery have independent display routes', () => {
   assert.match(checkin.app.innerHTML, /签到头像墙/);
   assert.match(checkin.app.innerHTML, /签到二维码/);
   assert.doesNotMatch(checkin.app.innerHTML, /id="drawButton"|id="prizeResults"/);
+  assert.doesNotMatch(checkin.app.innerHTML, /shapeButton|backAdminButton|data-drag-key|qr-resize-handle|\/screen\/settings/);
 
   for (const route of ['/screen/lottery', '/screen']) {
     const lottery = browser(route);
@@ -64,7 +68,53 @@ test('check-in and lottery have independent display routes', () => {
     assert.match(lottery.app.innerHTML, /id="drawButton"/);
     assert.match(lottery.app.innerHTML, /id="prizeResults"/);
     assert.doesNotMatch(lottery.app.innerHTML, /签到二维码|最近签到/);
+    assert.doesNotMatch(lottery.app.innerHTML, /backAdminButton|data-drag-key|\/screen\/settings/);
   }
+});
+
+test('the separate settings route accepts only an administrator role', () => {
+  const ui = browser('/screen/settings');
+  ui.run(`state.loginDefaults = { admin: true };`);
+  ui.context.render();
+  assert.match(ui.app.innerHTML, /进入大屏设置/);
+  assert.doesNotMatch(ui.app.innerHTML, /id="settingsForm"|value="admin123"|data-role="screen"/);
+  ui.selectors.set('#settingsForm', { addEventListener() {} });
+  ui.run(`state.accessRole = 'admin';`);
+  ui.context.render();
+  assert.match(ui.app.innerHTML, /id="settingsForm"|name="qrSize"/);
+  assert.match(ui.app.innerHTML, /name="logoX"/);
+});
+
+test('only new arrivals animate, both in the live check-in list and the admin table', () => {
+  const live = browser('/screen/checkin');
+  live.context.render();
+  assert.doesNotMatch(live.app.innerHTML, /checkin-arrival/);
+  live.context.connectSocket();
+  const next = live.run(`({ ...state, attendees: [...state.attendees, { id: 'new', name: '新签到来宾' }] })`);
+  live.events.get('state')(next);
+  assert.match(live.app.innerHTML, /recent-checkin-item checkin-arrival" data-checkin-id="new"/);
+  assert.equal((live.app.innerHTML.match(/checkin-arrival/g) || []).length, 1);
+  live.events.get('state')(next);
+  assert.doesNotMatch(live.app.innerHTML, /checkin-arrival/);
+  const admin = browser('/admin');
+  admin.run(`state.accessRole = 'admin';`);
+  admin.context.connectSocket();
+  admin.events.get('state')({ ...next, accessRole: 'admin' });
+  assert.match(admin.app.innerHTML, /<tr class="checkin-arrival" data-checkin-id="new"/);
+});
+
+test('the preset editor separates an empty selection from saved names', () => {
+  const ui = browser('/admin');
+  const empty = ui.run('renderFixedWinnerEditor(state.prizes[0])');
+  assert.match(empty, /内定人员（0）/);
+  assert.match(empty, /value="" disabled selected/);
+  assert.match(empty, /暂无内定人员/);
+  assert.doesNotMatch(empty, /data-remove-fixed/);
+  ui.run(`state.prizes[0].fixedWinnerIds = ['a'];`);
+  const saved = ui.run('renderFixedWinnerEditor(state.prizes[0])');
+  assert.match(saved, /内定人员（1）/);
+  assert.match(saved, /data-remove-fixed="a"/);
+  assert.doesNotMatch(saved, /<option value="a"/);
 });
 
 test('results and expanded list include only the selected prize', () => {

@@ -11,7 +11,7 @@ export async function startTestServer(options = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wechat-checkin-test-'));
   fs.cpSync(path.join(root, 'src'), path.join(directory, 'src'), { recursive: true });
   fs.copyFileSync(path.join(root, 'package.json'), path.join(directory, 'package.json'));
-  fs.symlinkSync(path.join(root, 'node_modules'), path.join(directory, 'node_modules'), 'dir');
+  fs.symlinkSync(path.join(root, 'node_modules'), path.join(directory, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
   fs.mkdirSync(path.join(directory, 'data'));
   fs.copyFileSync(path.join(root, 'data/store.example.json'), path.join(directory, 'data/store.example.json'));
 
@@ -23,9 +23,10 @@ export async function startTestServer(options = {}) {
     port = probe.address().port;
     await new Promise((resolve) => probe.close(resolve));
   }
-  const child = spawn(process.execPath, ['src/server.js'], {
+  const args = options.preload ? ['--import', options.preload, 'src/server.js'] : ['src/server.js'];
+  const child = spawn(process.execPath, args, {
     cwd: directory,
-    env: { ...process.env, WECHAT_APP_ID: '', WECHAT_APP_SECRET: '', PUBLIC_URL: '', ...options.env, PORT: String(port) },
+    env: { ...process.env, WECHAT_APP_ID: '', WECHAT_APP_SECRET: '', PUBLIC_URL: '', PUBLIC_DEPLOYMENT: '', ...options.env, PORT: String(port) },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let output = '';

@@ -131,3 +131,41 @@ test('whitespace-only names never send a request', async () => {
   await ui.context.submitLocalCheckin({ preventDefault() {} });
   assert.equal(ui.selectors.get('#checkinError').textContent, '请填写姓名');
 });
+
+test('public check-in displays the authorized WeChat avatar and no upload controls', () => {
+  const ui = browser();
+  ui.run(`state.deployment = 'public'; state.wechat = {
+    ready: true, profile: { nickname: '微信昵称', avatar: 'https://thirdwx.qlogo.cn/test/132' }
+  };`);
+  ui.context.renderCheckin();
+  assert.match(ui.app.innerHTML, /src="https:\/\/thirdwx\.qlogo\.cn\/test\/132"/);
+  assert.match(ui.app.innerHTML, /name="name"[^>]*value="微信昵称"/);
+  assert.doesNotMatch(ui.app.innerHTML, /type="file"|选择头像|使用姓名头像/);
+});
+
+test('public authorization failures offer a retry without presenting a manual form', () => {
+  const ui = browser();
+  ui.run(`state.deployment = 'public'; window.location.search = '?wechat=denied';`);
+  ui.context.renderCheckin();
+  assert.match(ui.app.innerHTML, /未同意微信授权/);
+  assert.match(ui.app.innerHTML, /href="\/wechat\/oauth\/start"/);
+  assert.doesNotMatch(ui.app.innerHTML, /name="name"|type="file"/);
+  ui.context.navigator.userAgent = 'Chrome';
+  ui.context.renderCheckin();
+  assert.match(ui.app.innerHTML, /请用微信扫码签到/);
+  assert.doesNotMatch(ui.app.innerHTML, /href="\/wechat\/oauth\/start"/);
+});
+
+test('public check-in sends only the confirmed name', async () => {
+  const ui = browser();
+  ui.run(`state.deployment = 'public'; state.wechat.profile = { nickname: '微信昵称', avatar: 'https://thirdwx.qlogo.cn/test/132' };
+    checkinUiState.name = '  王小明  '; checkinUiState.file = {};`);
+  const calls = [];
+  ui.context.api = async (url, options) => {
+    calls.push({ url, body: JSON.parse(JSON.stringify(options.body)) });
+    return { attendee: { id: 'guest', name: '王小明' } };
+  };
+  await ui.context.submitLocalCheckin({ preventDefault() {} });
+  assert.deepEqual(calls, [{ url: '/api/checkin', body: { name: '王小明' } }]);
+  assert.match(ui.app.innerHTML, /签到成功/);
+});

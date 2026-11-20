@@ -1,6 +1,7 @@
 const app = document.querySelector('#app');
 
 let state = {
+  accessRole: null,
   config: {},
   attendees: [],
   prizes: [],
@@ -11,6 +12,8 @@ let state = {
 let socket;
 let activeAdminTab = 'checkins';
 let selectedLoginRole = 'admin';
+const settingsPath = '/screen/settings';
+const pendingFixedPrizes = new Set();
 const checkinUiState = {
   visitorId: '',
   initialized: false,
@@ -38,9 +41,6 @@ let drawState = {
   railTick: 0,
   activeAnimation: 'sphere'
 };
-let dragState = {
-  active: false
-};
 
 document.addEventListener('DOMContentLoaded', boot);
 window.addEventListener('popstate', render);
@@ -61,18 +61,29 @@ async function refreshState() {
 }
 
 function connectSocket() {
+  if (state.deployment === 'public' && (!state.accessRole || window.location.pathname === '/checkin')) return;
   socket = io();
   socket.on('state', (nextState) => {
-    state = nextState;
-    const keepCheckinDraft = window.location.pathname === '/checkin'
+    const previous = state;
+    state = { accessRole: previous.accessRole, ...nextState };
+    const path = window.location.pathname;
+    const keepCheckinDraft = path === '/checkin'
       && state.config.checkinMode !== 'wechat' && document.querySelector('#localCheckinForm');
-    if (keepCheckinDraft) return;
-    if (!drawState.rolling && !dragState.active) render();
+    if (keepCheckinDraft || (path === settingsPath && document.querySelector('#settingsForm'))) return;
+    if (path === '/admin' && activeAdminTab === 'prizes' && syncPrizeEditors(previous)) return;
+    const known = new Set(previous.attendees.map((attendee) => attendee.id));
+    const arrivals = new Set(state.attendees.filter((attendee) => !known.has(attendee.id)).map((attendee) => attendee.id));
+    if (!drawState.rolling) render({ arrivals });
   });
   socket.on('checkin:new', showFlyCard);
+  if (state.deployment === 'public') {
+    socket.on('disconnect', (reason) => {
+      if (reason === 'io server disconnect') window.location.reload();
+    });
+  }
 }
 
-function render() {
+function render({ arrivals = new Set() } = {}) {
   const path = window.location.pathname;
   if (path !== '/screen/checkin') {
     document.querySelectorAll('.fly-card').forEach((card) => card.remove());
@@ -86,8 +97,13 @@ function render() {
       renderLogin('screen');
       return;
     }
-    if (path === '/screen/checkin') renderCheckinScreen();
+    if (path === '/screen/checkin') renderCheckinScreen(arrivals);
     else renderScreen();
+    return;
+  }
+  if (path === settingsPath) {
+    if (hasRole('admin')) renderSettingsPage();
+    else renderLogin('admin');
     return;
   }
   if (path === '/admin') {
@@ -95,14 +111,14 @@ function render() {
       renderLogin('admin');
       return;
     }
-    renderAdmin();
+    renderAdmin(arrivals);
     return;
   }
   renderLogin('admin');
 }
 
 function hasRole(role) {
-  const current = sessionStorage.getItem('lotteryRole');
+  const current = state.accessRole;
   if (role === 'screen') return current === 'screen' || current === 'admin';
   return current === 'admin';
 }
@@ -140,7 +156,9 @@ async function api(path, options = {}) {
   const payload = contentType.includes('application/json') ? await response.json() : await response.text();
   if (!response.ok) {
     const message = typeof payload === 'object' ? payload.message : payload;
-    throw new Error(message || '请求失败');
+    const error = new Error(message || '请求失败');
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -151,10 +169,22 @@ async function uploadFile(file, kind) {
   return api(`/api/upload/${kind}`, { method: 'POST', body: data });
 }
 
+function bindLogout() {
+  document.querySelector('#logoutButton')?.addEventListener('click', async () => {
+    try {
+      await api('/api/logout', { method: 'POST' });
+      window.location.reload();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+}
+
 function renderLogin(forceRole = selectedLoginRole) {
-  selectedLoginRole = forceRole;
+  const isSettings = window.location.pathname === settingsPath;
+  selectedLoginRole = isSettings ? 'admin' : forceRole;
   const defaultPassword = selectedLoginRole === 'admin' ? 'admin123' : 'screen123';
-  const passwordValue = state.loginDefaults?.[selectedLoginRole] ? defaultPassword : '';
+  const passwordValue = !isSettings && state.loginDefaults?.[selectedLoginRole] ? defaultPassword : '';
   app.innerHTML = `
     <main class="login-page">
       <section class="login-card">
@@ -164,18 +194,18 @@ function renderLogin(forceRole = selectedLoginRole) {
             <h1>${escapeHtml(state.config.eventTitle || '微信签到抽奖')}</h1>
             <p>${escapeHtml(state.config.subtitle || '扫码签到 · 头像滚动 · 幸运抽奖')}</p>
           </div>
-          <p>内网运行 / 大屏互动 / 后台导出</p>
+          ${state.deployment === 'public' ? '' : '<p>内网运行 / 大屏互动 / 后台导出</p>'}
         </div>
         <form class="login-form" id="loginForm">
-          <div class="role-switch">
+          ${isSettings ? '<h2>大屏设置</h2>' : `<div class="role-switch">
             <button type="button" data-role="admin" class="${selectedLoginRole === 'admin' ? 'active' : ''}">后台</button>
             <button type="button" data-role="screen" class="${selectedLoginRole === 'screen' ? 'active' : ''}">大屏</button>
-          </div>
+          </div>`}
           <label>
             访问密码
             <input id="loginPassword" type="password" autocomplete="current-password" value="${passwordValue}" placeholder="请输入访问密码" />
           </label>
-          <button type="submit">进入${selectedLoginRole === 'admin' ? '后台' : '大屏'}</button>
+          <button type="submit">进入${isSettings ? '大屏设置' : selectedLoginRole === 'admin' ? '后台' : '大屏'}</button>
           <div class="error-text" id="loginError"></div>
         </form>
       </section>
@@ -193,10 +223,10 @@ function renderLogin(forceRole = selectedLoginRole) {
         method: 'POST',
         body: { role: selectedLoginRole, password: document.querySelector('#loginPassword').value }
       });
-      sessionStorage.setItem('lotteryRole', result.role);
       const screenPath = ['/screen', '/screen/checkin', '/screen/lottery'].includes(location.pathname)
         ? location.pathname : '/screen/checkin';
-      navigate(result.role === 'screen' ? screenPath : result.path);
+      const path = isSettings ? settingsPath : result.role === 'screen' ? screenPath : result.path;
+      window.location.assign(path);
     } catch (err) {
       error.textContent = err.message;
     }
@@ -204,6 +234,10 @@ function renderLogin(forceRole = selectedLoginRole) {
 }
 
 function renderCheckin() {
+  if (state.deployment === 'public') {
+    renderPublicWechatCheckin();
+    return;
+  }
   if (state.config.checkinMode !== 'wechat') {
     renderLocalCheckin();
     return;
@@ -251,16 +285,41 @@ function renderCheckin() {
   `;
 }
 
+function renderPublicWechatCheckin() {
+  const { ready, profile } = state.wechat || {};
+  if (profile) {
+    renderCheckinForm(state.selfAttendee, profile);
+    return;
+  }
+  const insideWechat = /MicroMessenger/i.test(navigator.userAgent);
+  const outcome = new URLSearchParams(window.location.search).get('wechat');
+  const title = !ready ? '微信签到暂未开放'
+    : !insideWechat ? '请用微信扫码签到'
+      : outcome === 'denied' ? '未同意微信授权'
+        : outcome ? '微信授权未完成' : '微信授权签到';
+  app.innerHTML = `
+    <main class="checkin-page local-checkin-page">
+      <section class="checkin-card local-checkin-card success-state">
+        <div class="brand-mark">微</div>
+        <h1 class="mobile-title">${title}</h1>
+        ${ready && insideWechat ? '<a class="button-link" href="/wechat/oauth/start">授权微信签到</a>' : ''}
+      </section>
+    </main>`;
+}
+
 function renderLocalCheckin() {
   const visitorId = getVisitorId();
-  const attendee = state.attendees.find((item) => item.openid === visitorId);
+  renderCheckinForm(state.attendees.find((item) => item.openid === visitorId));
+}
+
+function renderCheckinForm(attendee, wechatProfile) {
   if (attendee && !checkinUiState.editing) {
     renderCheckinSuccess(attendee, true);
     return;
   }
   if (!checkinUiState.initialized) {
-    checkinUiState.name = attendee?.name || '';
-    checkinUiState.avatar = attendee?.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
+    checkinUiState.name = attendee?.name || wechatProfile?.nickname?.slice(0, 40) || '';
+    checkinUiState.avatar = wechatProfile ? wechatProfile.avatar : attendee?.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
     checkinUiState.initialized = true;
   }
   const preview = checkinUiState.preview || checkinUiState.avatar || makeAvatarDataUrl(checkinUiState.name);
@@ -272,19 +331,21 @@ function renderLocalCheckin() {
           <h1>${escapeHtml(state.config.eventTitle || '欢迎来到活动现场')}</h1>
         </header>
         <form id="localCheckinForm" class="checkin-form">
-          <div class="checkin-avatar-field">
+          <div class="checkin-avatar-field${wechatProfile ? ' is-wechat' : ''}">
             <div class="checkin-avatar-preview">
               <img id="checkinAvatarPreview" src="${escapeHtml(preview)}" alt="签到头像预览" />
-              <button id="chooseCheckinAvatar" type="button" aria-label="选择头像" title="选择头像">${screenIcon('camera')}</button>
+              ${wechatProfile ? '' : `<button id="chooseCheckinAvatar" type="button" aria-label="选择头像" title="选择头像">${screenIcon('camera')}</button>`}
             </div>
-            <input id="checkinAvatarFile" class="checkin-file-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif" aria-label="上传头像" tabindex="-1" />
-            <span class="checkin-avatar-label">头像（选填）</span>
-            <button id="useNameAvatar" class="checkin-text-button" type="button" ${checkinUiState.preview || checkinUiState.avatar ? '' : 'hidden'}>使用姓名头像</button>
+            ${wechatProfile ? `<span class="checkin-avatar-label">${wechatProfile.avatar ? '微信头像' : '姓名头像'}</span>` : `
+              <input id="checkinAvatarFile" class="checkin-file-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif" aria-label="上传头像" tabindex="-1" />
+              <span class="checkin-avatar-label">头像（选填）</span>
+              <button id="useNameAvatar" class="checkin-text-button" type="button" ${checkinUiState.preview || checkinUiState.avatar ? '' : 'hidden'}>使用姓名头像</button>`}
           </div>
           <label for="checkinName">姓名
             <input id="checkinName" name="name" autocomplete="name" maxlength="40" required value="${escapeHtml(checkinUiState.name)}" placeholder="请输入姓名" />
           </label>
           <div id="checkinError" class="error-text" role="alert" aria-live="polite"></div>
+          ${wechatProfile ? '<a id="retryWechatCheckin" class="checkin-text-button" href="/wechat/oauth/start" hidden>重新授权</a>' : ''}
           <button id="submitCheckin" type="submit">${screenIcon('check')}<span>${attendee ? '保存资料' : '确认签到'}</span></button>
         </form>
       </section>
@@ -348,13 +409,13 @@ async function prepareCheckinAvatar(file) {
 
 function bindLocalCheckinForm() {
   const fileInput = document.querySelector('#checkinAvatarFile');
-  document.querySelector('#chooseCheckinAvatar').addEventListener('click', () => fileInput.click());
+  document.querySelector('#chooseCheckinAvatar')?.addEventListener('click', () => fileInput.click());
   document.querySelector('#checkinName').addEventListener('input', (event) => {
     checkinUiState.name = event.target.value;
     document.querySelector('#checkinError').textContent = '';
     updateCheckinAvatarPreview();
   });
-  document.querySelector('#useNameAvatar').addEventListener('click', () => {
+  document.querySelector('#useNameAvatar')?.addEventListener('click', () => {
     clearCheckinPreview();
     checkinUiState.avatar = '';
     checkinUiState.file = null;
@@ -362,7 +423,7 @@ function bindLocalCheckinForm() {
     document.querySelector('#checkinError').textContent = '';
     updateCheckinAvatarPreview();
   });
-  fileInput.addEventListener('change', async () => {
+  fileInput?.addEventListener('change', async () => {
     const file = fileInput.files?.[0];
     if (!file) return;
     checkinUiState.preparing = true;
@@ -400,8 +461,9 @@ async function submitLocalCheckin(event) {
   }
   checkinUiState.submitting = true;
   updateCheckinBusy();
+  const isPublic = state.deployment === 'public';
   try {
-    if (checkinUiState.file) {
+    if (!isPublic && checkinUiState.file) {
       const data = new FormData();
       data.append('file', checkinUiState.file);
       const uploaded = await api('/api/checkin/avatar', { method: 'POST', body: data });
@@ -410,16 +472,22 @@ async function submitLocalCheckin(event) {
     }
     const result = await api('/api/checkin', {
       method: 'POST',
-      body: { visitorId: getVisitorId(), name, avatar: checkinUiState.avatar, source: 'local-form' }
+      body: isPublic ? { name } : { name, avatar: checkinUiState.avatar, visitorId: getVisitorId(), source: 'local-form' }
     });
-    const index = state.attendees.findIndex((item) => item.id === result.attendee.id);
-    if (index < 0) state.attendees.push(result.attendee);
-    else state.attendees[index] = result.attendee;
+    if (isPublic) {
+      state.selfAttendee = result.attendee;
+    } else {
+      const index = state.attendees.findIndex((item) => item.id === result.attendee.id);
+      if (index < 0) state.attendees.push(result.attendee);
+      else state.attendees[index] = result.attendee;
+    }
     checkinUiState.editing = false;
     clearCheckinPreview();
-    renderLocalCheckin();
+    renderCheckin();
   } catch (err) {
     error.textContent = err.message;
+    const retry = document.querySelector('#retryWechatCheckin');
+    if (retry && err.status === 401) retry.hidden = false;
   } finally {
     checkinUiState.submitting = false;
     updateCheckinBusy();
@@ -442,8 +510,9 @@ function renderCheckinSuccess(attendee, local = false) {
       checkinUiState.initialized = true;
       checkinUiState.editing = true;
       checkinUiState.name = attendee.name;
-      checkinUiState.avatar = attendee.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
-      renderLocalCheckin();
+      checkinUiState.avatar = state.deployment === 'public' ? state.wechat.profile.avatar
+        : attendee.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
+      renderCheckin();
     });
   }
 }
@@ -492,7 +561,7 @@ function renderScreenBrand() {
   const config = state.config || {};
   const x = clampScreenPosition(config.logoPosition?.x, 32, 190, 'x');
   const y = clampScreenPosition(config.logoPosition?.y, 24, 82, 'y');
-  return `<div class="draggable screen-logo" data-drag-key="logoPosition" aria-label="可拖动活动 Logo" title="按住拖动 Logo" style="left:${x}px; top:${y}px;">
+  return `<div class="screen-logo" style="left:${x}px; top:${y}px;">
     ${config.logoUrl ? `<img src="${escapeHtml(config.logoUrl)}" alt="活动 Logo" />` : '<div class="brand-mark">签</div><strong>活动现场</strong>'}
   </div>`;
 }
@@ -504,15 +573,14 @@ function renderScreenToolbar(mode) {
       <a href="/screen/lottery" data-screen-path="/screen/lottery" ${mode === 'lottery' ? 'aria-current="page"' : ''}>${screenIcon('gift')}幸运抽奖</a>
     </nav>
     <div class="screen-tools">
-      ${mode === 'checkin' ? `<button class="ghost icon-button" id="shapeButton" aria-label="切换头像墙" title="切换头像墙">${screenIcon('layout-grid')}</button>` : ''}
       <button class="ghost icon-button" id="fullscreenButton" aria-label="全屏" title="全屏">${screenIcon('maximize')}</button>
       <button class="ghost icon-button" id="musicButton" aria-label="音乐" title="音乐" ${state.config.musicUrl ? '' : 'disabled'}>${screenIcon('music-2')}</button>
-      <button class="ghost icon-button" id="backAdminButton" aria-label="后台" title="后台">${screenIcon('settings')}</button>
+      ${state.deployment === 'public' ? `<button class="ghost icon-button" id="logoutButton" aria-label="退出登录" title="退出登录">${screenIcon('log-out')}</button>` : ''}
     </div>
   </footer>`;
 }
 
-function renderCheckinScreen() {
+function renderCheckinScreen(arrivals = new Set()) {
   disposeDrawScene();
   const config = state.config || {};
   const qrSize = clampQrSize(config.qrSize || 106);
@@ -522,14 +590,9 @@ function renderCheckinScreen() {
   app.innerHTML = `
     <main class="screen-page checkin-display-page">
       ${renderScreenBrand()}
-      <div class="draggable qr-card" data-drag-key="qrPosition" aria-label="可拖动签到二维码" title="按住拖动二维码，拖右下角可缩放" style="right:auto; left:${qrX}px; top:${qrY}px; --qr-size:${qrSize}px;">
+      <div class="qr-card" style="right:auto; left:${qrX}px; top:${qrY}px; --qr-size:${qrSize}px;">
         <img draggable="false" src="/api/qrcode.svg?target=${encodeURIComponent(state.checkinUrl || `${location.origin}/checkin`)}" alt="签到二维码" />
         <strong>微信扫码签到</strong>
-        <button class="qr-resize-handle" type="button" aria-label="拖动缩放二维码" title="拖动缩放"></button>
-        <div class="qr-size-controls" aria-label="二维码大小调整">
-          <button class="qr-size-step" type="button" data-qr-size-delta="-24" aria-label="缩小二维码">-</button>
-          <button class="qr-size-step" type="button" data-qr-size-delta="24" aria-label="放大二维码">+</button>
-        </div>
       </div>
       ${config.musicUrl ? `<audio id="screenAudio" src="${escapeHtml(config.musicUrl)}" loop></audio>` : ''}
       <div class="screen-content checkin-display-content">
@@ -544,7 +607,7 @@ function renderCheckinScreen() {
         <section class="recent-checkins" aria-label="最近签到">
           <h2>最近签到</h2>
           <div class="recent-checkin-list">${recent.length ? recent.map((attendee) => `
-            <div class="recent-checkin-item">
+            <div class="recent-checkin-item${arrivals.has(attendee.id) ? ' checkin-arrival' : ''}" data-checkin-id="${escapeHtml(attendee.id)}">
               <img src="${escapeHtml(attendee.avatar || makeAvatarDataUrl(attendee.name))}" alt="" />
               <strong>${escapeHtml(attendee.name || attendee.nickname || '微信嘉宾')}</strong>
             </div>`).join('') : '<span class="checkin-waiting">等待嘉宾入场</span>'}
@@ -555,8 +618,6 @@ function renderCheckinScreen() {
     </main>`;
   paintAvatarStage();
   bindScreenEvents();
-  bindDrag();
-  bindQrResize();
   window.lucide?.createIcons();
 }
 
@@ -640,7 +701,6 @@ function renderScreen() {
     </main>
   `;
   bindScreenEvents();
-  bindDrag();
   window.lucide?.createIcons();
 }
 
@@ -795,13 +855,7 @@ function getStageAvoidRect(stage, width, height) {
   const qr = document.querySelector('.qr-card');
   if (!qr) return null;
   const stageRect = stage.getBoundingClientRect();
-  const rects = [qr, qr.querySelector('.qr-size-controls')].filter(Boolean).map((item) => item.getBoundingClientRect());
-  const qrRect = rects.reduce((acc, rect) => ({
-    left: Math.min(acc.left, rect.left),
-    top: Math.min(acc.top, rect.top),
-    right: Math.max(acc.right, rect.right),
-    bottom: Math.max(acc.bottom, rect.bottom)
-  }));
+  const qrRect = qr.getBoundingClientRect();
   const overlaps = qrRect.right > stageRect.left && qrRect.left < stageRect.right && qrRect.bottom > stageRect.top && qrRect.top < stageRect.bottom;
   if (!overlaps) return null;
   const padding = 10;
@@ -1021,12 +1075,7 @@ function bindScreenEvents() {
     if (audio.paused) await audio.play();
     else audio.pause();
   });
-  document.querySelector('#shapeButton')?.addEventListener('click', async () => {
-    const modes = ['orbit', 'sphere', 'wall', 'text'];
-    const current = modes.indexOf(state.config.wallMode || 'sphere');
-    await api('/api/config', { method: 'PUT', body: { wallMode: modes[(current + 1) % modes.length] } });
-  });
-  document.querySelector('#backAdminButton')?.addEventListener('click', () => navigate('/admin'));
+  bindLogout();
   document.querySelector('#openWinnerBookButton')?.addEventListener('click', showWinnerBookModal);
   document.querySelector('#previousPrizeButton')?.addEventListener('click', () => cycleScreenPrize(-1));
   document.querySelector('#nextPrizeButton')?.addEventListener('click', () => cycleScreenPrize(1));
@@ -1052,223 +1101,6 @@ function bindScreenEvents() {
   });
   document.querySelector('#drawStopButton')?.addEventListener('click', () => {
     if (drawState.rolling) stopDraw();
-  });
-}
-
-function bindDrag() {
-  document.querySelectorAll('[data-drag-key]').forEach((node) => {
-    let startX = 0;
-    let startY = 0;
-    let originX = 0;
-    let originY = 0;
-    let moved = false;
-    let currentPointerId = null;
-    node.draggable = false;
-    const removeMouseFallback = () => {
-      document.removeEventListener('mousemove', mouseMove);
-      document.removeEventListener('mouseup', mouseUp);
-    };
-    const beginDrag = (clientX, clientY) => {
-      if (dragState.active) return false;
-      dragState.active = true;
-      moved = false;
-      startX = clientX;
-      startY = clientY;
-      originX = Number.parseInt(node.style.left, 10) || 0;
-      originY = Number.parseInt(node.style.top, 10) || 0;
-      node.classList.add('is-dragging');
-      return true;
-    };
-    const moveDrag = (clientX, clientY) => {
-      moved = true;
-      const x = clampDragCoordinate(originX + clientX - startX, node.offsetWidth, 'x');
-      const y = clampDragCoordinate(originY + clientY - startY, node.offsetHeight, 'y');
-      node.style.left = `${x}px`;
-      node.style.top = `${y}px`;
-    };
-    const endDrag = async () => {
-      if (!dragState.active) return;
-      removeMouseFallback();
-      node.classList.remove('is-dragging');
-      dragState.active = false;
-      currentPointerId = null;
-      if (!moved) return;
-      const key = node.dataset.dragKey;
-      await api('/api/config', {
-        method: 'PUT',
-        body: { [key]: { x: Number.parseInt(node.style.left, 10) || 0, y: Number.parseInt(node.style.top, 10) || 0 } }
-      });
-    };
-    const cancelDrag = () => {
-      removeMouseFallback();
-      node.classList.remove('is-dragging');
-      dragState.active = false;
-      currentPointerId = null;
-    };
-    const mouseMove = (event) => {
-      event.preventDefault();
-      moveDrag(event.clientX, event.clientY);
-    };
-    const mouseUp = async (event) => {
-      event.preventDefault();
-      document.removeEventListener('mousemove', mouseMove);
-      document.removeEventListener('mouseup', mouseUp);
-      await endDrag();
-    };
-    node.addEventListener('pointerdown', (event) => {
-      if (event.target.closest('.qr-resize-handle')) return;
-      event.preventDefault();
-      if (!beginDrag(event.clientX, event.clientY)) return;
-      currentPointerId = event.pointerId;
-      node.setPointerCapture(event.pointerId);
-      document.addEventListener('mousemove', mouseMove);
-      document.addEventListener('mouseup', mouseUp);
-    });
-    node.addEventListener('pointermove', (event) => {
-      if (currentPointerId !== event.pointerId || !node.hasPointerCapture(event.pointerId)) return;
-      moveDrag(event.clientX, event.clientY);
-    });
-    node.addEventListener('pointerup', async (event) => {
-      if (currentPointerId !== event.pointerId || !node.hasPointerCapture(event.pointerId)) return;
-      node.releasePointerCapture(event.pointerId);
-      await endDrag();
-    });
-    node.addEventListener('pointercancel', (event) => {
-      if (node.hasPointerCapture(event.pointerId)) node.releasePointerCapture(event.pointerId);
-      cancelDrag();
-    });
-    node.addEventListener('mousedown', (event) => {
-      if (event.target.closest('.qr-resize-handle')) return;
-      if (event.button !== 0 || dragState.active) return;
-      event.preventDefault();
-      if (!beginDrag(event.clientX, event.clientY)) return;
-      document.addEventListener('mousemove', mouseMove);
-      document.addEventListener('mouseup', mouseUp);
-    });
-    node.addEventListener('dragstart', (event) => {
-      event.preventDefault();
-    });
-  });
-}
-
-function clampDragCoordinate(value, elementSize, axis) {
-  const viewport = axis === 'y' ? window.innerHeight : window.innerWidth;
-  const max = Math.max(0, viewport - elementSize - 8);
-  return Math.max(0, Math.min(Math.round(value), max));
-}
-
-function bindQrResize() {
-  const card = document.querySelector('.qr-card');
-  const handle = document.querySelector('.qr-resize-handle');
-  if (!card || !handle) return;
-  let startX = 0;
-  let startY = 0;
-  let startSize = 0;
-  let currentSize = 0;
-  let resizing = false;
-  const beginResize = (clientX, clientY) => {
-    resizing = true;
-    dragState.active = true;
-    startX = clientX;
-    startY = clientY;
-    startSize = Number.parseInt(getComputedStyle(card).getPropertyValue('--qr-size'), 10) || card.offsetWidth;
-    currentSize = startSize;
-    card.classList.add('is-resizing');
-  };
-  const moveResize = (clientX, clientY) => {
-    if (!resizing) return;
-    const delta = Math.max(clientX - startX, clientY - startY);
-    currentSize = clampQrSize(startSize + delta);
-    card.style.setProperty('--qr-size', `${currentSize}px`);
-    const nextX = clampDragCoordinate(Number.parseInt(card.style.left, 10) || 0, card.offsetWidth, 'x');
-    const nextY = clampDragCoordinate(Number.parseInt(card.style.top, 10) || 0, card.offsetHeight, 'y');
-    card.style.left = `${nextX}px`;
-    card.style.top = `${nextY}px`;
-  };
-  const endResize = async () => {
-    if (!resizing) return;
-    resizing = false;
-    dragState.active = false;
-    card.classList.remove('is-resizing');
-    document.removeEventListener('mousemove', mouseMove);
-    document.removeEventListener('mouseup', mouseUp);
-    await api('/api/config', {
-      method: 'PUT',
-      body: {
-        qrSize: currentSize,
-        qrPosition: {
-          x: Number.parseInt(card.style.left, 10) || 0,
-          y: Number.parseInt(card.style.top, 10) || 0
-        }
-      }
-    });
-  };
-  const saveSize = async (nextSize) => {
-    const size = clampQrSize(nextSize);
-    card.style.setProperty('--qr-size', `${size}px`);
-    const nextX = clampDragCoordinate(Number.parseInt(card.style.left, 10) || 0, card.offsetWidth, 'x');
-    const nextY = clampDragCoordinate(Number.parseInt(card.style.top, 10) || 0, card.offsetHeight, 'y');
-    card.style.left = `${nextX}px`;
-    card.style.top = `${nextY}px`;
-    await api('/api/config', {
-      method: 'PUT',
-      body: {
-        qrSize: size,
-        qrPosition: { x: nextX, y: nextY }
-      }
-    });
-  };
-  const mouseMove = (event) => {
-    event.preventDefault();
-    moveResize(event.clientX, event.clientY);
-  };
-  const mouseUp = async (event) => {
-    event.preventDefault();
-    await endResize();
-  };
-  handle.addEventListener('pointerdown', (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    beginResize(event.clientX, event.clientY);
-    handle.setPointerCapture(event.pointerId);
-  });
-  handle.addEventListener('pointermove', (event) => {
-    if (!handle.hasPointerCapture(event.pointerId)) return;
-    moveResize(event.clientX, event.clientY);
-  });
-  handle.addEventListener('pointerup', async (event) => {
-    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
-    await endResize();
-  });
-  handle.addEventListener('pointercancel', async (event) => {
-    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
-    await endResize();
-  });
-  handle.addEventListener('mousedown', (event) => {
-    if (event.button !== 0 || resizing) return;
-    event.preventDefault();
-    event.stopPropagation();
-    beginResize(event.clientX, event.clientY);
-    document.addEventListener('mousemove', mouseMove);
-    document.addEventListener('mouseup', mouseUp);
-  });
-  handle.addEventListener('click', (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-  });
-  document.querySelectorAll('.qr-size-step').forEach((button) => {
-    button.addEventListener('pointerdown', (event) => {
-      event.stopPropagation();
-    });
-    button.addEventListener('mousedown', (event) => {
-      event.stopPropagation();
-    });
-    button.addEventListener('click', async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const current = Number.parseInt(getComputedStyle(card).getPropertyValue('--qr-size'), 10) || card.offsetWidth;
-      await saveSize(current + Number(button.dataset.qrSizeDelta || 0));
-    });
   });
 }
 
@@ -1612,7 +1444,7 @@ function showFlyCard(attendee) {
   window.setTimeout(() => card.remove(), 2800);
 }
 
-function renderAdmin() {
+function renderAdmin(arrivals = new Set()) {
   const checkinCount = state.attendees.length;
   const winnerCount = state.winners.length;
   const prizeCount = state.prizes.length;
@@ -1623,10 +1455,11 @@ function renderAdmin() {
         <nav class="admin-nav">
           ${adminTabButton('checkins', '签到管理')}
           ${adminTabButton('prizes', '抽奖设置')}
-          ${adminTabButton('settings', '页面设置')}
+          <a class="button-link" href="${settingsPath}">大屏设置</a>
           ${adminTabButton('exports', '数据导出')}
           <a class="button-link" href="/screen/checkin">签到展示</a>
           <a class="button-link" href="/screen/lottery">抽奖大屏</a>
+          ${state.deployment === 'public' ? '<button type="button" id="logoutButton">退出登录</button>' : ''}
         </nav>
       </aside>
       <section class="admin-main">
@@ -1636,32 +1469,32 @@ function renderAdmin() {
             <p class="muted">${escapeHtml(state.checkinUrl || '')}</p>
           </div>
           <div class="stat-row">
-            <div class="stat"><span>已签到</span><strong>${checkinCount}</strong></div>
+            <div class="stat"><span>已签到</span><strong id="adminCheckinCount">${checkinCount}</strong></div>
             <div class="stat"><span>奖项</span><strong>${prizeCount}</strong></div>
             <div class="stat"><span>已中奖</span><strong>${winnerCount}</strong></div>
           </div>
         </header>
-        <div id="adminPanel">${renderAdminPanel()}</div>
+        <div id="adminPanel">${renderAdminPanel(arrivals)}</div>
       </section>
     </main>
   `;
   bindAdminEvents();
+  bindLogout();
 }
 
 function adminTabButton(tab, label) {
   return `<button type="button" data-tab="${tab}" class="${activeAdminTab === tab ? 'active' : ''}">${label}</button>`;
 }
 
-function renderAdminPanel() {
+function renderAdminPanel(arrivals) {
   if (activeAdminTab === 'prizes') return renderPrizePanel();
-  if (activeAdminTab === 'settings') return renderSettingsPanel();
   if (activeAdminTab === 'exports') return renderExportPanel();
-  return renderCheckinPanel();
+  return renderCheckinPanel(arrivals);
 }
 
-function renderCheckinPanel() {
+function renderCheckinPanel(arrivals = new Set()) {
   const rows = state.attendees.slice().reverse().map((attendee, index) => `
-    <tr>
+    <tr${arrivals.has(attendee.id) ? ' class="checkin-arrival"' : ''} data-checkin-id="${escapeHtml(attendee.id)}">
       <td class="nowrap">${state.attendees.length - index}</td>
       <td><img class="table-avatar" src="${escapeHtml(attendee.avatar || makeAvatarDataUrl(attendee.name))}" alt="" /></td>
       <td>${escapeHtml(attendee.name)}</td>
@@ -1704,7 +1537,6 @@ function renderCheckinPanel() {
 }
 
 function renderPrizePanel() {
-  const attendeeOptions = state.attendees.map((attendee) => `<option value="${escapeHtml(attendee.id)}">${escapeHtml(attendee.name)} · ${escapeHtml(attendee.company || attendee.phone || '')}</option>`).join('');
   const prizeCards = state.prizes.map((prize) => {
     const winners = state.winners.filter((winner) => winner.prizeId === prize.id).length;
     return `
@@ -1727,11 +1559,9 @@ function renderPrizePanel() {
             </label>
             <label>奖品图片<input class="prize-image" type="file" accept="image/*" /></label>
           </div>
-          <label>内定人员
-            <select class="fixed-select" multiple>
-              ${state.attendees.map((attendee) => `<option value="${escapeHtml(attendee.id)}" ${(prize.fixedWinnerIds || []).includes(attendee.id) ? 'selected' : ''}>${escapeHtml(attendee.name)} · ${escapeHtml(attendee.company || attendee.phone || '')}</option>`).join('') || attendeeOptions}
-            </select>
-          </label>
+          <fieldset class="fixed-winner-editor" data-fixed-editor="${escapeHtml(prize.id)}">
+            ${renderFixedWinnerEditor(prize)}
+          </fieldset>
           <p class="muted">已抽出 ${winners} / ${Number(prize.quantity || 0)}</p>
           <div class="toolbar">
             <button data-save-prize="${escapeHtml(prize.id)}">保存奖项</button>
@@ -1771,6 +1601,96 @@ function renderPrizePanel() {
   `;
 }
 
+function renderFixedWinnerEditor(prize, selected = '') {
+  const attendeeById = new Map(state.attendees.map((attendee) => [attendee.id, attendee]));
+  const fixed = (prize.fixedWinnerIds || []).map((id) => attendeeById.get(id)).filter(Boolean);
+  const fixedIds = new Set(fixed.map((attendee) => attendee.id));
+  const candidates = state.attendees.filter((attendee) => !fixedIds.has(attendee.id));
+  const busy = pendingFixedPrizes.has(prize.id);
+  const chosen = candidates.some((attendee) => attendee.id === selected) ? selected : '';
+  return `
+    <legend>内定人员（${fixed.length}）</legend>
+    <form class="fixed-winner-add">
+      <select name="attendeeId" aria-label="待选签到人员" required ${!candidates.length || busy ? 'disabled' : ''}>
+        <option value="" disabled ${chosen ? '' : 'selected'}>${candidates.length ? '选择签到人员' : '暂无可添加人员'}</option>
+        ${candidates.map((attendee) => {
+          const detail = attendee.company || attendee.phone || formatTime(attendee.checkedInAt);
+          const label = detail ? `${attendee.name} · ${detail}` : attendee.name;
+          return `<option value="${escapeHtml(attendee.id)}" ${chosen === attendee.id ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+        }).join('')}
+      </select>
+      <button type="submit" class="secondary" ${!chosen || busy ? 'disabled' : ''}>${screenIcon('plus')}添加</button>
+    </form>
+    ${fixed.length ? `<ul class="fixed-winner-list" aria-label="已内定人员">${fixed.map((attendee) => `
+      <li><span>${escapeHtml(attendee.name)}</span>
+        <button type="button" class="secondary icon-button" data-remove-fixed="${escapeHtml(attendee.id)}"
+          aria-label="移除 ${escapeHtml(attendee.name)}" title="移除 ${escapeHtml(attendee.name)}" ${busy ? 'disabled' : ''}>${screenIcon('x')}</button>
+      </li>`).join('')}</ul>` : '<p class="muted fixed-winner-empty">暂无内定人员</p>'}
+  `;
+}
+
+function syncPrizeEditors(previous) {
+  const form = document.querySelector('#newPrizeForm');
+  if (!form || JSON.stringify(previous.prizes.map(withoutFixedWinners)) !== JSON.stringify(state.prizes.map(withoutFixedWinners))
+      || previous.winners.map((winner) => winner.id).join() !== state.winners.map((winner) => winner.id).join()) return false;
+  const count = document.querySelector('#adminCheckinCount');
+  if (count) count.textContent = state.attendees.length;
+  document.querySelectorAll('[data-fixed-editor]').forEach((editor) => {
+    const selected = editor.querySelector('select').value;
+    refreshFixedWinnerEditor(editor, selected);
+  });
+  window.lucide?.createIcons();
+  return true;
+}
+
+function withoutFixedWinners({ fixedWinnerIds, ...prize }) {
+  return prize;
+}
+
+function refreshFixedWinnerEditor(editor, selected = '') {
+  const prize = state.prizes.find((item) => item.id === editor.dataset.fixedEditor);
+  if (prize) editor.innerHTML = renderFixedWinnerEditor(prize, selected);
+}
+
+async function changeFixedWinner(editor, attendeeId, add) {
+  const id = editor.dataset.fixedEditor;
+  if (!attendeeId || pendingFixedPrizes.has(id)) return;
+  pendingFixedPrizes.add(id);
+  refreshFixedWinnerEditor(editor, add ? attendeeId : editor.querySelector('select').value);
+  try {
+    const endpoint = `/api/prizes/${encodeURIComponent(id)}/fixed-winners`;
+    const result = add
+      ? await api(endpoint, { method: 'POST', body: { attendeeId } })
+      : await api(`${endpoint}/${encodeURIComponent(attendeeId)}`, { method: 'DELETE' });
+    const prize = state.prizes.find((item) => item.id === id);
+    if (prize) prize.fixedWinnerIds = result.fixedWinnerIds;
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    pendingFixedPrizes.delete(id);
+    const currentEditor = document.querySelector(`[data-fixed-editor="${CSS.escape(id)}"]`);
+    if (currentEditor) refreshFixedWinnerEditor(currentEditor, currentEditor.querySelector('select').value);
+    window.lucide?.createIcons();
+  }
+}
+
+function renderSettingsPage() {
+  app.innerHTML = `
+    <main class="settings-page">
+      <header class="settings-header">
+        <h1>大屏设置</h1>
+        <nav class="toolbar" aria-label="后台与大屏">
+          <a class="button-link secondary" href="/admin">${screenIcon('arrow-left')}后台</a>
+          <a class="button-link secondary" href="/screen/checkin">签到大屏</a>
+          <a class="button-link secondary" href="/screen/lottery">抽奖大屏</a>
+        </nav>
+      </header>
+      ${renderSettingsPanel()}
+    </main>`;
+  document.querySelector('#settingsForm').addEventListener('submit', saveSettings);
+  window.lucide?.createIcons();
+}
+
 function modeOption(value, label, current) {
   return `<option value="${value}" ${current === value ? 'selected' : ''}>${label}</option>`;
 }
@@ -1785,12 +1705,12 @@ function renderSettingsPanel() {
           <label>活动标题<input name="eventTitle" value="${escapeHtml(config.eventTitle || '')}" /></label>
           <label>副标题<input name="subtitle" value="${escapeHtml(config.subtitle || '')}" /></label>
         </div>
-        <label>签到方式
+        ${state.deployment === 'public' ? '' : `<label>签到方式
           <select name="checkinMode" aria-label="签到方式">
             ${modeOption('local', '内网填写姓名与头像', config.checkinMode || 'local')}
             ${modeOption('wechat', '微信网页授权', config.checkinMode)}
           </select>
-        </label>
+        </label>`}
         <div class="grid-3">
           <label>头像墙模式
             <select name="wallMode">
@@ -1811,18 +1731,31 @@ function renderSettingsPanel() {
           <label>上传 Logo<input name="logo" type="file" accept="image/*" /></label>
           <label>上传背景音乐<input name="music" type="file" accept="audio/*" /></label>
         </div>
+        <fieldset class="settings-layout">
+          <legend>大屏布局</legend>
+          <div class="grid-2">
+            <label>Logo 左边距（px）<input name="logoX" type="number" min="0" max="3000" value="${Number(config.logoPosition?.x ?? 32)}" required /></label>
+            <label>Logo 上边距（px）<input name="logoY" type="number" min="0" max="3000" value="${Number(config.logoPosition?.y ?? 24)}" required /></label>
+          </div>
+          <div class="grid-3">
+            <label>二维码左边距（px）<input name="qrX" type="number" min="0" max="3000" value="${Number(config.qrPosition?.x ?? 1120)}" required /></label>
+            <label>二维码上边距（px）<input name="qrY" type="number" min="0" max="3000" value="${Number(config.qrPosition?.y ?? 28)}" required /></label>
+            <label>二维码大小（px）<input name="qrSize" type="number" min="88" max="280" value="${Number(config.qrSize ?? 106)}" required /></label>
+          </div>
+        </fieldset>
         <label>单位下拉预设
           <textarea name="companies">${escapeHtml((config.companies || []).join('\n'))}</textarea>
         </label>
-        <div class="grid-2">
+        ${state.deployment === 'public' ? '' : `<div class="grid-2">
           <label>后台新密码<input name="adminPassword" type="password" autocomplete="new-password" /></label>
           <label>大屏新密码<input name="screenPassword" type="password" autocomplete="new-password" /></label>
-        </div>
+        </div>`}
         <label style="display:flex;align-items:center;gap:10px;">
           <input name="allowRepeatWinners" type="checkbox" style="width:18px;min-height:18px;" ${config.allowRepeatWinners ? 'checked' : ''} />
           允许同一人员重复中奖
         </label>
         <div class="toolbar"><button type="submit">保存设置</button></div>
+        <div id="settingsError" class="error-text" role="alert"></div>
       </form>
     </section>
     <section class="panel">
@@ -1878,6 +1811,21 @@ function renderExportPanel() {
 }
 
 function bindAdminEvents() {
+  const panel = document.querySelector('#adminPanel');
+  panel?.addEventListener('change', (event) => {
+    const form = event.target.closest('.fixed-winner-add');
+    if (form) form.querySelector('button').disabled = !event.target.value;
+  });
+  panel?.addEventListener('submit', (event) => {
+    if (!event.target.matches('.fixed-winner-add')) return;
+    event.preventDefault();
+    const editor = event.target.closest('[data-fixed-editor]');
+    changeFixedWinner(editor, event.target.querySelector('select').value, true);
+  });
+  panel?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-remove-fixed]');
+    if (button) changeFixedWinner(button.closest('[data-fixed-editor]'), button.dataset.removeFixed, false);
+  });
   document.querySelectorAll('[data-tab]').forEach((button) => {
     button.addEventListener('click', () => {
       activeAdminTab = button.dataset.tab;
@@ -1917,7 +1865,6 @@ function bindAdminEvents() {
       await api(`/api/prizes/${button.dataset.deletePrize}`, { method: 'DELETE' });
     });
   });
-  document.querySelector('#settingsForm')?.addEventListener('submit', saveSettings);
 }
 
 async function saveNewPrize(event) {
@@ -1951,16 +1898,14 @@ async function savePrize(id) {
     const uploaded = await uploadFile(file, 'prize');
     imageUrl = uploaded.url;
   }
-  const fixedWinnerIds = Array.from(card.querySelector('.fixed-select').selectedOptions).map((option) => option.value);
-  await api(`/api/prizes/${id}`, {
+  await api(`/api/prizes/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: {
       name: card.querySelector('.prize-name').value,
       quantity: card.querySelector('.prize-quantity').value,
       drawCount: card.querySelector('.prize-count').value,
       animation: card.querySelector('.prize-animation').value,
-      imageUrl,
-      fixedWinnerIds
+      imageUrl
     }
   });
   toast('奖项已保存');
@@ -1968,29 +1913,44 @@ async function savePrize(id) {
 
 async function saveSettings(event) {
   event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  const logoFile = form.get('logo');
-  const musicFile = form.get('music');
-  let logoUrl = state.config.logoUrl || '';
-  let musicUrl = state.config.musicUrl || '';
-  if (logoFile && logoFile.size) logoUrl = (await uploadFile(logoFile, 'logo')).url;
-  if (musicFile && musicFile.size) musicUrl = (await uploadFile(musicFile, 'music')).url;
-  const body = {
-    eventTitle: form.get('eventTitle'),
-    subtitle: form.get('subtitle'),
-    checkinMode: form.get('checkinMode'),
-    wallMode: form.get('wallMode'),
-    wallText: form.get('wallText'),
-    theme: form.get('theme'),
-    logoUrl,
-    musicUrl,
-    companies: String(form.get('companies') || '').split('\n').map((item) => item.trim()).filter(Boolean),
-    allowRepeatWinners: form.get('allowRepeatWinners') === 'on'
-  };
-  if (form.get('adminPassword')) body.adminPassword = form.get('adminPassword');
-  if (form.get('screenPassword')) body.screenPassword = form.get('screenPassword');
-  await api('/api/config', { method: 'PUT', body });
-  toast('设置已保存');
+  const settings = event.currentTarget;
+  const submit = settings.querySelector('button[type="submit"]');
+  const error = settings.querySelector('#settingsError');
+  if (submit.disabled) return;
+  const form = new FormData(settings);
+  submit.disabled = true;
+  error.textContent = '';
+  try {
+    const logoFile = form.get('logo');
+    const musicFile = form.get('music');
+    const logoUrl = logoFile?.size ? (await uploadFile(logoFile, 'logo')).url : state.config.logoUrl || '';
+    const musicUrl = musicFile?.size ? (await uploadFile(musicFile, 'music')).url : state.config.musicUrl || '';
+    const body = {
+      eventTitle: form.get('eventTitle'),
+      subtitle: form.get('subtitle'),
+      checkinMode: form.get('checkinMode'),
+      wallMode: form.get('wallMode'),
+      wallText: form.get('wallText'),
+      theme: form.get('theme'),
+      logoUrl,
+      musicUrl,
+      logoPosition: { x: Number(form.get('logoX')), y: Number(form.get('logoY')) },
+      qrPosition: { x: Number(form.get('qrX')), y: Number(form.get('qrY')) },
+      qrSize: Number(form.get('qrSize')),
+      companies: String(form.get('companies') || '').split('\n').map((item) => item.trim()).filter(Boolean),
+      allowRepeatWinners: form.get('allowRepeatWinners') === 'on'
+    };
+    if (form.get('adminPassword')) body.adminPassword = form.get('adminPassword');
+    if (form.get('screenPassword')) body.screenPassword = form.get('screenPassword');
+    const saved = await api('/api/config', { method: 'PUT', body });
+    state.config = saved.config;
+    settings.querySelectorAll('input[type="password"], input[type="file"]').forEach((input) => { input.value = ''; });
+    toast('设置已保存');
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    submit.disabled = false;
+  }
 }
 
 function toast(message) {
