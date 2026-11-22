@@ -11,8 +11,8 @@ export function readToken(req, name) {
   return /^[a-f0-9]{64}$/.test(value || '') ? value : '';
 }
 
-export function createStaffSessions({ secure = true } = {}) {
-  const cookie = secure ? '__Host-checkin-staff' : 'checkin-staff';
+export function createStaffSessions({ secure = true, name = 'staff' } = {}) {
+  const cookie = `${secure ? '__Host-' : ''}checkin-${name}`;
   const options = { httpOnly: true, secure, sameSite: 'strict', path: '/' };
   const sessions = new Map();
   setInterval(() => {
@@ -52,7 +52,7 @@ function clientIp(req) {
   return isIP(host) ? host : req.socket.remoteAddress;
 }
 
-export function createPublicAccess(env) {
+export function createPublicAccess(env, settingsAccess) {
   if (env.PUBLIC_DEPLOYMENT !== '1') return null;
 
   let url;
@@ -65,7 +65,14 @@ export function createPublicAccess(env) {
       || passwords.admin === passwords.screen) {
     throw new Error('Set distinct ADMIN_PASSWORD and SCREEN_PASSWORD values of 16-80 characters.');
   }
-  const passwordHashes = { admin: hash(passwords.admin), screen: hash(passwords.screen) };
+  if (env.SETTINGS_PASSWORD) {
+    const password = env.SETTINGS_PASSWORD;
+    if (password.length < 16 || password.length > 80 || password.trim() !== password || Object.values(passwords).includes(password)) {
+      throw new Error('Set a distinct SETTINGS_PASSWORD value of 16-80 characters.');
+    }
+    passwords.settings = password;
+  }
+  const passwordHashes = Object.fromEntries(Object.entries(passwords).map(([role, password]) => [role, hash(password)]));
   const staff = createStaffSessions();
   const attempts = new Map();
   setInterval(() => {
@@ -115,6 +122,10 @@ export function createPublicAccess(env) {
       if (allowAttempt(res, `checkin:${clientIp(req)}`, 600, 60_000)) next();
       return;
     }
+    if (settingsAccess?.session(req)) {
+      if (['PUT /config', 'POST /upload/logo', 'POST /upload/music', 'POST /logout'].includes(route)) return next();
+      if (!role) return res.status(403).json({ message: '设置账号无权执行此操作' });
+    }
     if (role === 'admin') return next();
     if (role === 'screen' && ['POST /draw', 'POST /logout'].includes(route)) return next();
     res.status(role ? 403 : 401).json({ message: role ? '当前角色无权执行此操作' : '请先登录' });
@@ -123,9 +134,10 @@ export function createPublicAccess(env) {
   return {
     origin: url.origin,
     guardApi,
+    settingsReady: Boolean(passwordHashes.settings),
     ...staff,
     allowWechatStart: (req, res) => allowAttempt(res, `wechat:${clientIp(req)}`, 600, 60_000),
-    matchesPassword: (role, value) => typeof value === 'string' && value.length <= 80
+    matchesPassword: (role, value) => Boolean(passwordHashes[role]) && typeof value === 'string' && value.length <= 80
       && timingSafeEqual(Buffer.from(hash(value), 'hex'), Buffer.from(passwordHashes[role], 'hex'))
   };
 }

@@ -10,15 +10,16 @@ let state = {
   checkinUrl: ''
 };
 let socket;
+let spatialRotationFrame = 0;
 let activeAdminTab = 'checkins';
 let selectedLoginRole = 'admin';
 const settingsPath = '/screen/settings';
 const pendingFixedPrizes = new Set();
 const checkinUiState = {
-  visitorId: '',
   initialized: false,
   editing: false,
   name: '',
+  phone: '',
   avatar: '',
   preview: '',
   file: null,
@@ -45,7 +46,7 @@ let drawState = {
 document.addEventListener('DOMContentLoaded', boot);
 window.addEventListener('popstate', render);
 window.addEventListener('resize', () => {
-  if (drawState.rolling) refreshDrawGeometry(drawState.activeAnimation);
+  if (drawState.rolling && !drawState.stopping) refreshDrawGeometry(drawState.activeAnimation);
   else if (window.location.pathname === '/screen/checkin') paintAvatarStage();
 });
 
@@ -61,31 +62,31 @@ async function refreshState() {
 }
 
 function connectSocket() {
-  if (state.deployment === 'public' && (!state.accessRole || window.location.pathname === '/checkin')) return;
+  if (!state.accessRole || [settingsPath, '/checkin'].includes(window.location.pathname)) return;
   socket = io();
   socket.on('state', (nextState) => {
     const previous = state;
-    state = { accessRole: previous.accessRole, ...nextState };
+    state = { accessRole: previous.accessRole, hasSettingsAccess: previous.hasSettingsAccess, ...nextState };
     const path = window.location.pathname;
-    const keepCheckinDraft = path === '/checkin'
-      && state.config.checkinMode !== 'wechat' && document.querySelector('#localCheckinForm');
-    if (keepCheckinDraft || (path === settingsPath && document.querySelector('#settingsForm'))) return;
+    if (path === '/screen/checkin' && document.querySelector('.checkin-display-page')
+        && previous.accessRole === state.accessRole && previous.checkinUrl === state.checkinUrl
+        && JSON.stringify(previous.config) === JSON.stringify(state.config)
+        && JSON.stringify(previous.attendees) === JSON.stringify(state.attendees)) return;
     if (path === '/admin' && activeAdminTab === 'prizes' && syncPrizeEditors(previous)) return;
     const known = new Set(previous.attendees.map((attendee) => attendee.id));
     const arrivals = new Set(state.attendees.filter((attendee) => !known.has(attendee.id)).map((attendee) => attendee.id));
     if (!drawState.rolling) render({ arrivals });
   });
   socket.on('checkin:new', showFlyCard);
-  if (state.deployment === 'public') {
-    socket.on('disconnect', (reason) => {
-      if (reason === 'io server disconnect') window.location.reload();
-    });
-  }
+  socket.on('disconnect', (reason) => {
+    if (reason === 'io server disconnect') window.location.reload();
+  });
 }
 
 function render({ arrivals = new Set() } = {}) {
   const path = window.location.pathname;
   if (path !== '/screen/checkin') {
+    stopSpatialRotation();
     document.querySelectorAll('.fly-card').forEach((card) => card.remove());
   }
   if (path === '/checkin') {
@@ -94,6 +95,7 @@ function render({ arrivals = new Set() } = {}) {
   }
   if (['/screen', '/screen/checkin', '/screen/lottery'].includes(path)) {
     if (!hasRole('screen')) {
+      stopSpatialRotation();
       renderLogin('screen');
       return;
     }
@@ -102,8 +104,8 @@ function render({ arrivals = new Set() } = {}) {
     return;
   }
   if (path === settingsPath) {
-    if (hasRole('admin')) renderSettingsPage();
-    else renderLogin('admin');
+    if (state.hasSettingsAccess) renderSettingsPage();
+    else renderLogin('settings');
     return;
   }
   if (path === '/admin') {
@@ -169,10 +171,10 @@ async function uploadFile(file, kind) {
   return api(`/api/upload/${kind}`, { method: 'POST', body: data });
 }
 
-function bindLogout() {
+function bindLogout(role) {
   document.querySelector('#logoutButton')?.addEventListener('click', async () => {
     try {
-      await api('/api/logout', { method: 'POST' });
+      await api('/api/logout', { method: 'POST', body: role ? { role } : undefined });
       window.location.reload();
     } catch (error) {
       toast(error.message);
@@ -182,7 +184,7 @@ function bindLogout() {
 
 function renderLogin(forceRole = selectedLoginRole) {
   const isSettings = window.location.pathname === settingsPath;
-  selectedLoginRole = isSettings ? 'admin' : forceRole;
+  selectedLoginRole = isSettings ? 'settings' : forceRole;
   const defaultPassword = selectedLoginRole === 'admin' ? 'admin123' : 'screen123';
   const passwordValue = !isSettings && state.loginDefaults?.[selectedLoginRole] ? defaultPassword : '';
   app.innerHTML = `
@@ -202,7 +204,7 @@ function renderLogin(forceRole = selectedLoginRole) {
             <button type="button" data-role="screen" class="${selectedLoginRole === 'screen' ? 'active' : ''}">大屏</button>
           </div>`}
           <label>
-            访问密码
+            ${isSettings ? '大屏设置密码' : '访问密码'}
             <input id="loginPassword" type="password" autocomplete="current-password" value="${passwordValue}" placeholder="请输入访问密码" />
           </label>
           <button type="submit">进入${isSettings ? '大屏设置' : selectedLoginRole === 'admin' ? '后台' : '大屏'}</button>
@@ -233,59 +235,16 @@ function renderLogin(forceRole = selectedLoginRole) {
   });
 }
 
-function renderCheckin() {
-  if (state.deployment === 'public') {
-    renderPublicWechatCheckin();
-    return;
-  }
-  if (state.config.checkinMode !== 'wechat') {
-    renderLocalCheckin();
-    return;
-  }
-  const params = new URLSearchParams(window.location.search);
-  const isWechat = /MicroMessenger/i.test(navigator.userAgent);
-  const attendee = state.attendees.find((item) => item.id === params.get('attendee'));
-  if (params.get('checked') === '1') {
-    renderCheckinSuccess(attendee || {
-      name: '微信用户',
-      nickname: '微信用户',
-      avatar: makeAvatarDataUrl('微信')
-    });
-    return;
-  }
-  const wechat = state.wechat || {};
-  if (wechat.ready) {
-    app.innerHTML = `
-      <main class="checkin-page">
-        <section class="checkin-card success-state">
-          <div class="brand-mark">微</div>
-          <h1 class="mobile-title">微信授权签到</h1>
-          <p class="mobile-copy">${isWechat ? '正在打开微信授权，完成后自动签到。' : '请用微信扫码打开此页面完成自动签到。'}</p>
-          <a class="button-link" href="/wechat/oauth/start">打开微信授权</a>
-        </section>
-      </main>
-    `;
-    if (isWechat) window.location.replace('/wechat/oauth/start');
-    return;
-  }
-  const setupLine = wechat.needsPublicUrl
-    ? '还缺 PUBLIC_URL，请使用公网 HTTPS 域名作为微信网页授权回调地址。'
-    : '还没有配置微信公众号 AppID 和 AppSecret。';
-  app.innerHTML = `
-    <main class="checkin-page">
-      <section class="checkin-card success-state">
-        <div>
-          <div class="brand-mark">微</div>
-          <h1 class="mobile-title">微信授权未配置</h1>
-          <p class="mobile-copy">${escapeHtml(setupLine)}</p>
-        </div>
-        <p class="mobile-copy">配置完成后，来宾扫码无需填写资料，会直接获取微信昵称和头像进入签到名单。</p>
-      </section>
-    </main>
-  `;
+function isWechatCheckin() {
+  return state.deployment === 'public' || state.config.checkinMode === 'wechat';
 }
 
-function renderPublicWechatCheckin() {
+function renderCheckin() {
+  if (isWechatCheckin()) renderWechatCheckin();
+  else renderLocalCheckin();
+}
+
+function renderWechatCheckin() {
   const { ready, profile } = state.wechat || {};
   if (profile) {
     renderCheckinForm(state.selfAttendee, profile);
@@ -308,17 +267,17 @@ function renderPublicWechatCheckin() {
 }
 
 function renderLocalCheckin() {
-  const visitorId = getVisitorId();
-  renderCheckinForm(state.attendees.find((item) => item.openid === visitorId));
+  renderCheckinForm(state.selfAttendee);
 }
 
 function renderCheckinForm(attendee, wechatProfile) {
-  if (attendee && !checkinUiState.editing) {
+  if (attendee?.phone && !checkinUiState.editing) {
     renderCheckinSuccess(attendee, true);
     return;
   }
   if (!checkinUiState.initialized) {
-    checkinUiState.name = attendee?.name || wechatProfile?.nickname?.slice(0, 40) || '';
+    checkinUiState.name = attendee?.name || '';
+    checkinUiState.phone = attendee?.phone || '';
     checkinUiState.avatar = wechatProfile ? wechatProfile.avatar : attendee?.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
     checkinUiState.initialized = true;
   }
@@ -344,6 +303,9 @@ function renderCheckinForm(attendee, wechatProfile) {
           <label for="checkinName">姓名
             <input id="checkinName" name="name" autocomplete="name" maxlength="40" required value="${escapeHtml(checkinUiState.name)}" placeholder="请输入姓名" />
           </label>
+          <label for="checkinPhone">手机号
+            <input id="checkinPhone" name="phone" type="tel" inputmode="tel" autocomplete="tel" maxlength="32" required value="${escapeHtml(checkinUiState.phone)}" placeholder="请输入手机号" />
+          </label>
           <div id="checkinError" class="error-text" role="alert" aria-live="polite"></div>
           ${wechatProfile ? '<a id="retryWechatCheckin" class="checkin-text-button" href="/wechat/oauth/start" hidden>重新授权</a>' : ''}
           <button id="submitCheckin" type="submit">${screenIcon('check')}<span>${attendee ? '保存资料' : '确认签到'}</span></button>
@@ -367,8 +329,10 @@ function updateCheckinBusy() {
     const element = document.querySelector(selector);
     if (element) element.disabled = busy;
   }
-  const name = document.querySelector('#checkinName');
-  if (name) name.disabled = checkinUiState.submitting;
+  for (const selector of ['#checkinName', '#checkinPhone']) {
+    const element = document.querySelector(selector);
+    if (element) element.disabled = checkinUiState.submitting;
+  }
   const button = document.querySelector('#submitCheckin span');
   if (button) button.textContent = checkinUiState.submitting ? '正在提交' : checkinUiState.preparing ? '正在处理头像' : checkinUiState.editing ? '保存资料' : '确认签到';
   document.querySelector('#localCheckinForm')?.setAttribute('aria-busy', String(busy));
@@ -415,6 +379,10 @@ function bindLocalCheckinForm() {
     document.querySelector('#checkinError').textContent = '';
     updateCheckinAvatarPreview();
   });
+  document.querySelector('#checkinPhone').addEventListener('input', (event) => {
+    checkinUiState.phone = event.target.value;
+    document.querySelector('#checkinError').textContent = '';
+  });
   document.querySelector('#useNameAvatar')?.addEventListener('click', () => {
     clearCheckinPreview();
     checkinUiState.avatar = '';
@@ -451,7 +419,8 @@ function bindLocalCheckinForm() {
 async function submitLocalCheckin(event) {
   event.preventDefault();
   if (checkinUiState.submitting || checkinUiState.preparing) return;
-  const name = checkinUiState.name.replace(/\s+/g, ' ').trim();
+  const name = (document.querySelector('#checkinName')?.value ?? checkinUiState.name).replace(/\s+/g, ' ').trim();
+  const phone = (document.querySelector('#checkinPhone')?.value ?? checkinUiState.phone).trim();
   const error = document.querySelector('#checkinError');
   error.textContent = '';
   if (!name) {
@@ -459,11 +428,16 @@ async function submitLocalCheckin(event) {
     document.querySelector('#checkinName').focus();
     return;
   }
+  if (!phone) {
+    error.textContent = '请填写手机号';
+    document.querySelector('#checkinPhone').focus();
+    return;
+  }
   checkinUiState.submitting = true;
   updateCheckinBusy();
-  const isPublic = state.deployment === 'public';
+  const wechat = isWechatCheckin();
   try {
-    if (!isPublic && checkinUiState.file) {
+    if (!wechat && checkinUiState.file) {
       const data = new FormData();
       data.append('file', checkinUiState.file);
       const uploaded = await api('/api/checkin/avatar', { method: 'POST', body: data });
@@ -472,15 +446,9 @@ async function submitLocalCheckin(event) {
     }
     const result = await api('/api/checkin', {
       method: 'POST',
-      body: isPublic ? { name } : { name, avatar: checkinUiState.avatar, visitorId: getVisitorId(), source: 'local-form' }
+      body: wechat ? { name, phone } : { name, phone, avatar: checkinUiState.avatar }
     });
-    if (isPublic) {
-      state.selfAttendee = result.attendee;
-    } else {
-      const index = state.attendees.findIndex((item) => item.id === result.attendee.id);
-      if (index < 0) state.attendees.push(result.attendee);
-      else state.attendees[index] = result.attendee;
-    }
+    state.selfAttendee = result.attendee;
     checkinUiState.editing = false;
     clearCheckinPreview();
     renderCheckin();
@@ -510,31 +478,12 @@ function renderCheckinSuccess(attendee, local = false) {
       checkinUiState.initialized = true;
       checkinUiState.editing = true;
       checkinUiState.name = attendee.name;
-      checkinUiState.avatar = state.deployment === 'public' ? state.wechat.profile.avatar
+      checkinUiState.phone = attendee.phone || '';
+      checkinUiState.avatar = isWechatCheckin() ? state.wechat.profile.avatar
         : attendee.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
       renderCheckin();
     });
   }
-}
-
-function getVisitorId(openid) {
-  if (!openid && checkinUiState.visitorId) return checkinUiState.visitorId;
-  let visitorId = openid;
-  try {
-    visitorId ||= localStorage.getItem('wechatLotteryVisitorId');
-  } catch { /* Private webviews may disable storage. */ }
-  visitorId ||= `visitor-${cryptoRandom()}`;
-  checkinUiState.visitorId = visitorId;
-  try {
-    localStorage.setItem('wechatLotteryVisitorId', visitorId);
-  } catch { /* Keep a stable identity for this page session. */ }
-  return visitorId;
-}
-
-function cryptoRandom() {
-  const bytes = new Uint8Array(12);
-  window.crypto.getRandomValues(bytes);
-  return Array.from(bytes, (item) => item.toString(16).padStart(2, '0')).join('');
 }
 
 function makeAvatarDataUrl(seed) {
@@ -622,6 +571,7 @@ function renderCheckinScreen(arrivals = new Set()) {
 }
 
 function renderScreen() {
+  stopSpatialRotation();
   disposeDrawScene();
   const config = state.config || {};
   const selectedPrize = getSelectedScreenPrize();
@@ -751,17 +701,22 @@ function renderPrizeResults(prize) {
 }
 
 function paintAvatarStage(attendeePool = state.attendees) {
+  stopSpatialRotation();
   const stage = document.querySelector('#avatarStage');
   if (!stage) return;
   const wallMode = state.config.wallMode || 'sphere';
-  const visualMode = getVisualWallMode(wallMode, attendeePool.length);
+  const visualMode = drawState.rolling ? drawState.activeAnimation : getVisualWallMode(wallMode, attendeePool.length);
   stage.classList.remove('sphere', 'wall', 'text', 'orbit');
   stage.classList.add(visualMode);
-  const width = Math.max(stage.clientWidth, 320);
-  const height = Math.max(stage.clientHeight, 320);
+  const width = Math.max(stage.clientWidth, 1);
+  const height = Math.max(stage.clientHeight, 1);
   const wallCapacity = Math.max(24, Math.floor(width / 60) * Math.floor(height / 22));
   const maxVisible = ['sphere', 'orbit'].includes(visualMode) ? 520 : Math.min(180, wallCapacity);
   const attendees = attendeePool.slice(-maxVisible);
+  const drawingSphere = drawState.rolling && visualMode === 'sphere';
+  const spatialCheckin = window.location.pathname === '/screen/checkin' && ['sphere', 'orbit'].includes(visualMode);
+  const spatial = (drawingSphere || spatialCheckin) && attendees.length > 0;
+  stage.classList.toggle('is-spatial', spatial);
   stage.classList.toggle('is-dense', attendees.length >= 36);
   if (!attendees.length) {
     stage.innerHTML = '<div class="empty-stage">等待扫码签到</div>';
@@ -772,6 +727,10 @@ function paintAvatarStage(attendeePool = state.attendees) {
   stage.style.setProperty('--avatar-node-width', `${Math.max(avatarSize + 12, 56)}px`);
   stage.style.setProperty('--avatar-label-max', `${Math.max(avatarSize + 22, 64)}px`);
   const avoidRect = getStageAvoidRect(stage, width, height);
+  if (spatial) {
+    paintSpatialAvatarStage(stage, attendees, visualMode, width, height, avoidRect, drawingSphere);
+    return;
+  }
   const sphereBounds = visualMode === 'sphere' ? getSphereBounds(width, height, avoidRect) : null;
   const orbitBounds = visualMode === 'orbit' ? getOrbitBounds(width, height, avoidRect) : null;
   if (sphereBounds) {
@@ -806,6 +765,80 @@ function paintAvatarStage(attendeePool = state.attendees) {
       </div>
     `;
   }).join('');
+}
+
+function paintSpatialAvatarStage(stage, attendees, mode, width, height, avoidRect, drawing) {
+  const usableWidth = avoidRect && avoidRect.top < height * 0.48 && avoidRect.left > width * 0.55
+    ? avoidRect.left : width;
+  const centerX = usableWidth / 2;
+  const centerY = height * (drawing ? 0.45 : 0.49);
+  const radius = Math.min(usableWidth * 0.36, height * (drawing ? 0.29 : 0.36));
+  const size = Math.max(14, Math.min(drawing ? 62 : 68, radius * 1.55 / Math.sqrt(attendees.length), radius * 0.48));
+  stage.style.setProperty('--scene-x', `${centerX}px`);
+  stage.style.setProperty('--scene-y', `${centerY}px`);
+  stage.style.setProperty('--scene-diameter', `${radius * 2}px`);
+  stage.style.setProperty('--avatar-size', `${size}px`);
+  stage.innerHTML = attendees.map((attendee) => `
+    <div class="avatar-node" data-attendee-id="${escapeHtml(attendee.id)}">
+      <img src="${escapeHtml(attendee.avatar || makeAvatarDataUrl(attendee.name))}" alt="" />
+    </div>`).join('');
+
+  const nodes = stage.querySelectorAll('.avatar-node');
+  const points = spatialAvatarPoints(attendees.length, mode);
+  const motion = window.matchMedia?.('(prefers-reduced-motion: no-preference)');
+  const rotationSpeed = drawing ? 1080 : 2500;
+  function drawFrame(time) {
+    const moving = motion?.matches;
+    const angle = moving ? time / rotationSpeed : 0.5;
+    const sine = Math.sin(angle);
+    const cosine = Math.cos(angle);
+    nodes.forEach((node, index) => {
+      const point = projectAvatarPoint(points[index], sine, cosine);
+      node.style.transform = `translate3d(${centerX + point.x * radius}px, ${centerY + point.y * radius}px, 0) translate(-50%, -50%) scale(${point.scale})`;
+      node.style.opacity = point.opacity;
+      node.style.zIndex = point.depth;
+    });
+    if (moving) spatialRotationFrame = window.requestAnimationFrame(drawFrame);
+  }
+  drawFrame(performance.now());
+}
+
+function spatialAvatarPoints(count, mode) {
+  const ringTilts = [-0.43, 0.55, 0.13];
+  return Array.from({ length: count }, (_, index) => {
+    if (mode === 'orbit') {
+      const ring = index % ringTilts.length;
+      const amount = Math.ceil((count - ring) / ringTilts.length);
+      const angle = Math.floor(index / ringTilts.length) * Math.PI * 2 / amount + ring * 0.55;
+      const radius = 0.65 + ring * 0.18;
+      const depth = Math.sin(angle) * radius;
+      return { x: Math.cos(angle) * radius, y: Math.sin(ringTilts[ring]) * depth + (ring - 1) * 0.18, z: Math.cos(ringTilts[ring]) * depth };
+    }
+    const y = 1 - (index + 0.5) * 2 / count;
+    const radius = Math.sqrt(1 - y * y);
+    const angle = index * Math.PI * (3 - Math.sqrt(5));
+    return { x: Math.cos(angle) * radius, y, z: Math.sin(angle) * radius };
+  });
+}
+
+function projectAvatarPoint(point, sine, cosine) {
+  const x = point.x * cosine + point.z * sine;
+  const z = -point.x * sine + point.z * cosine;
+  const y = point.y * 0.94 - z * 0.34;
+  const depth = point.y * 0.34 + z * 0.94;
+  const perspective = 3 / (3 - depth);
+  return {
+    x: x * perspective,
+    y: -y * perspective,
+    scale: perspective * (1 + depth * 0.18),
+    opacity: Math.min(1, 0.66 + depth * 0.35),
+    depth: Math.round((depth + 1.2) * 1000)
+  };
+}
+
+function stopSpatialRotation() {
+  if (spatialRotationFrame) window.cancelAnimationFrame(spatialRotationFrame);
+  spatialRotationFrame = 0;
 }
 
 function getVisualWallMode(mode, count) {
@@ -1129,6 +1162,7 @@ function startDraw() {
   drawState.count = Math.max(1, Math.min(Number(document.querySelector('#screenCount')?.value) || 1, remainingCount));
   drawState.railTick = 0;
   drawState.activeAnimation = ['orbit', 'sphere', 'wall', 'text'].includes(prize.animation) ? prize.animation : 'sphere';
+  const spherical = drawState.activeAnimation === 'sphere';
   setDrawEffects(true, drawState.activeAnimation);
   paintAvatarStage(drawState.candidates);
   startDrawScene(drawState.activeAnimation);
@@ -1140,9 +1174,9 @@ function startDraw() {
     const attendee = drawState.candidates[Math.floor(Math.random() * drawState.candidates.length)];
     highlightRollingCandidate(attendee);
     drawState.railTick += 1;
-    if (drawState.railTick % 2 === 0) updateDrawFocusRail(attendee);
-  }, 70);
-  drawState.fxTimer = window.setInterval(syncSphereDepth, 180);
+    if (spherical || drawState.railTick % 2 === 0) updateDrawFocusRail(attendee);
+  }, spherical ? 140 : 70);
+  if (drawState.activeAnimation === 'orbit') drawState.fxTimer = window.setInterval(syncOrbitDepth, 180);
 }
 
 async function stopDraw() {
@@ -1150,6 +1184,7 @@ async function stopDraw() {
   drawState.stopping = true;
   window.clearInterval(drawState.timer);
   window.clearInterval(drawState.fxTimer);
+  stopSpatialRotation();
   const stopButton = document.querySelector('#drawStopButton');
   stopButton.disabled = true;
   stopButton.querySelector('strong').textContent = '正在揭晓';
@@ -1187,7 +1222,7 @@ function availableCandidates() {
 }
 
 async function startDrawScene(animation) {
-  if (!['sphere', 'orbit'].includes(animation)) return;
+  if (animation !== 'orbit') return;
   const runId = drawState.runId;
   try {
     const { createLotteryScene } = await import('/lottery-scene.js');
@@ -1228,10 +1263,10 @@ function setDrawEffects(active, animation = drawState.activeAnimation) {
   if (page) page.dataset.drawAnimation = active ? animation : '';
   stage?.classList.toggle('drawing', active);
   document.querySelector('.rolling-card')?.classList.toggle('is-rolling', active);
-  if (active && stage) {
+  if (active && stage && animation !== 'sphere') {
     window.requestAnimationFrame(() => {
       refreshDrawGeometry(animation);
-      syncSphereDepth();
+      syncOrbitDepth();
     });
   }
   if (!active) {
@@ -1247,12 +1282,16 @@ function setDrawEffects(active, animation = drawState.activeAnimation) {
 }
 
 function refreshDrawGeometry(animation) {
+  if (animation === 'sphere') {
+    paintAvatarStage(drawState.candidates);
+    return;
+  }
   const stage = document.querySelector('#avatarStage');
   if (!stage) return;
   const nodes = Array.from(stage.querySelectorAll('.avatar-node'));
   const width = Math.max(stage.clientWidth, 280);
   const height = Math.max(stage.clientHeight, 320);
-  const mode = ['orbit', 'sphere', 'wall', 'text'].includes(animation) ? animation : 'sphere';
+  const mode = animation;
   stage.classList.remove('draw-mode-sphere', 'draw-mode-orbit', 'draw-mode-wall', 'draw-mode-text');
   stage.classList.add(`draw-mode-${mode}`);
 
@@ -1273,7 +1312,7 @@ function refreshDrawGeometry(animation) {
   }
 
   nodes.forEach((node, index) => {
-    const position = getDrawSpherePosition(index, nodes.length, width, height, mode);
+    const position = getDrawOrbitPosition(index, nodes.length, width, height);
     node.dataset.sphereAngle = String(position.angle);
     node.style.setProperty('--sphere-angle', `${position.angle}deg`);
     node.style.setProperty('--sphere-y', `${position.y}px`);
@@ -1283,7 +1322,7 @@ function refreshDrawGeometry(animation) {
   });
 }
 
-function getDrawSpherePosition(index, count, width, height, mode) {
+function getDrawOrbitPosition(index, count, width, height) {
   const safeCount = Math.max(count, 1);
   const rings = Math.max(6, Math.ceil(Math.sqrt(safeCount)));
   const row = Math.floor((index / safeCount) * rings);
@@ -1291,12 +1330,10 @@ function getDrawSpherePosition(index, count, width, height, mode) {
   const yUnit = -0.94 + progress * 1.88;
   const ringRadius = Math.max(0.22, Math.sqrt(Math.max(0, 1 - yUnit * yUnit)));
   const angle = (index * 137.508 + row * 21) % 360;
-  const baseRadius = mode === 'orbit'
-    ? Math.min(width * 0.38, height * 0.42)
-    : Math.min(width * 0.34, height * 0.48);
+  const baseRadius = Math.min(width * 0.38, height * 0.42);
   return {
     angle: Math.round(angle * 100) / 100,
-    y: Math.round(yUnit * height * (mode === 'orbit' ? 0.26 : 0.41)),
+    y: Math.round(yUnit * height * 0.26),
     radius: Math.round(Math.max(35, baseRadius * ringRadius)),
     scale: (0.72 + ringRadius * 0.34).toFixed(2),
     delay: Number((index * -0.08).toFixed(2))
@@ -1304,9 +1341,10 @@ function getDrawSpherePosition(index, count, width, height, mode) {
 }
 
 function highlightRollingCandidate(attendee) {
-  document.querySelectorAll('.avatar-node.draw-hot').forEach((node) => node.classList.remove('draw-hot'));
-  if (!attendee?.id) return;
-  const node = document.querySelector(`[data-attendee-id="${CSS.escape(attendee.id)}"]`);
+  const node = attendee?.id ? document.querySelector(`[data-attendee-id="${CSS.escape(attendee.id)}"]`) : null;
+  document.querySelectorAll('.avatar-node.draw-hot').forEach((active) => {
+    if (active !== node) active.classList.remove('draw-hot');
+  });
   node?.classList.add('draw-hot');
 }
 
@@ -1340,9 +1378,9 @@ function updateDrawFocusRail(centerAttendee) {
   `;
 }
 
-function syncSphereDepth() {
-  if (!['sphere', 'orbit'].includes(drawState.activeAnimation)) return;
-  document.querySelectorAll('.avatar-stage.drawing .avatar-node').forEach((node, index) => {
+function syncOrbitDepth() {
+  if (drawState.activeAnimation !== 'orbit') return;
+  document.querySelectorAll('.avatar-stage.drawing .avatar-node').forEach((node) => {
     const angle = Number(node.dataset.sphereAngle || 0) + (Date.now() / 12000) * 360;
     const z = Math.cos((angle * Math.PI) / 180);
     node.style.zIndex = node.classList.contains('draw-hot') ? '68' : String(8 + Math.round((z + 1) * 24));
@@ -1433,6 +1471,13 @@ function showFlyCard(attendee) {
   document.querySelector('.fly-card')?.remove();
   const card = document.createElement('div');
   card.className = 'fly-card';
+  const qr = document.querySelector('.qr-card')?.getBoundingClientRect();
+  const wall = document.querySelector('#avatarStage')?.getBoundingClientRect();
+  if (qr) {
+    card.style.setProperty('--arrival-from-x', `${qr.left + qr.width / 2 - window.innerWidth / 2}px`);
+    card.style.setProperty('--arrival-from-y', `${qr.bottom - window.innerHeight / 2}px`);
+  }
+  if (wall) card.style.setProperty('--arrival-to-y', `${wall.top + wall.height / 2 - window.innerHeight / 2}px`);
   card.innerHTML = `
     <img class="winner-avatar" src="${escapeHtml(attendee.avatar || makeAvatarDataUrl(attendee.name))}" alt="" />
     <div>
@@ -1441,7 +1486,7 @@ function showFlyCard(attendee) {
     </div>
   `;
   document.body.appendChild(card);
-  window.setTimeout(() => card.remove(), 2800);
+  window.setTimeout(() => card.remove(), 2500);
 }
 
 function renderAdmin(arrivals = new Set()) {
@@ -1583,8 +1628,8 @@ function renderPrizePanel() {
         <div class="grid-2">
           <label>动画方式
             <select name="animation">
-              <option value="orbit">星环排列</option>
               <option value="sphere">球形滚动</option>
+              <option value="orbit">星环排列</option>
               <option value="wall">头像矩阵</option>
               <option value="text">文字造型</option>
             </select>
@@ -1619,12 +1664,12 @@ function renderFixedWinnerEditor(prize, selected = '') {
           return `<option value="${escapeHtml(attendee.id)}" ${chosen === attendee.id ? 'selected' : ''}>${escapeHtml(label)}</option>`;
         }).join('')}
       </select>
-      <button type="submit" class="secondary" ${!chosen || busy ? 'disabled' : ''}>${screenIcon('plus')}添加</button>
+      <button type="submit" class="secondary" ${!chosen || busy ? 'disabled' : ''}>${screenIcon('plus')}添加内定</button>
     </form>
     ${fixed.length ? `<ul class="fixed-winner-list" aria-label="已内定人员">${fixed.map((attendee) => `
       <li><span>${escapeHtml(attendee.name)}</span>
-        <button type="button" class="secondary icon-button" data-remove-fixed="${escapeHtml(attendee.id)}"
-          aria-label="移除 ${escapeHtml(attendee.name)}" title="移除 ${escapeHtml(attendee.name)}" ${busy ? 'disabled' : ''}>${screenIcon('x')}</button>
+        <button type="button" class="secondary" data-remove-fixed="${escapeHtml(attendee.id)}"
+          aria-label="取消 ${escapeHtml(attendee.name)} 的内定" ${busy ? 'disabled' : ''}>${screenIcon('x')}删除</button>
       </li>`).join('')}</ul>` : '<p class="muted fixed-winner-empty">暂无内定人员</p>'}
   `;
 }
@@ -1683,11 +1728,13 @@ function renderSettingsPage() {
           <a class="button-link secondary" href="/admin">${screenIcon('arrow-left')}后台</a>
           <a class="button-link secondary" href="/screen/checkin">签到大屏</a>
           <a class="button-link secondary" href="/screen/lottery">抽奖大屏</a>
+          <button type="button" class="secondary" id="logoutButton">退出设置</button>
         </nav>
       </header>
       ${renderSettingsPanel()}
     </main>`;
   document.querySelector('#settingsForm').addEventListener('submit', saveSettings);
+  bindLogout('settings');
   window.lucide?.createIcons();
 }
 
@@ -1746,7 +1793,7 @@ function renderSettingsPanel() {
         <label>单位下拉预设
           <textarea name="companies">${escapeHtml((config.companies || []).join('\n'))}</textarea>
         </label>
-        ${state.deployment === 'public' ? '' : `<div class="grid-2">
+        ${state.deployment === 'public' || !hasRole('admin') ? '' : `<div class="grid-2">
           <label>后台新密码<input name="adminPassword" type="password" autocomplete="new-password" /></label>
           <label>大屏新密码<input name="screenPassword" type="password" autocomplete="new-password" /></label>
         </div>`}

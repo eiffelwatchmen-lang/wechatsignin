@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { createPublicAccess } from '../src/public-access.js';
 import { startTestServer } from './helpers/test-server.js';
 
 const origin = 'https://checkin.example.test';
 const adminPassword = 'test-admin-password-1234';
 const screenPassword = 'test-screen-password-1234';
+const settingsPassword = 'test-settings-password-1234';
 const avatarUrl = 'https://thirdwx.qlogo.cn/mmopen/test-avatar/132';
-const credentials = { PUBLIC_DEPLOYMENT: '1', PUBLIC_URL: origin, ADMIN_PASSWORD: adminPassword, SCREEN_PASSWORD: screenPassword };
+const credentials = {
+  PUBLIC_DEPLOYMENT: '1', PUBLIC_URL: origin, ADMIN_PASSWORD: adminPassword,
+  SCREEN_PASSWORD: screenPassword, SETTINGS_PASSWORD: settingsPassword
+};
 let server;
 let guestCookie;
 let guestId;
@@ -18,7 +21,7 @@ let screenCookie;
 before(async () => {
   server = await startTestServer({
     env: { ...credentials, WECHAT_APP_ID: 'test-app-id', WECHAT_APP_SECRET: 'test-app-secret' },
-    preload: fileURLToPath(new URL('./helpers/mock-wechat.js', import.meta.url))
+    preload: new URL('./helpers/mock-wechat.js', import.meta.url).href
   });
 });
 after(async () => { await server?.stop(); });
@@ -41,7 +44,7 @@ function cookieFrom(response, kind) {
   assert.match(cookie, /; Path=\//);
   assert.match(cookie, /; HttpOnly/);
   assert.match(cookie, /; Secure/);
-  assert.ok(cookie.includes(kind === 'staff' ? '; SameSite=Strict' : '; SameSite=Lax'));
+  assert.ok(cookie.includes(['staff', 'settings'].includes(kind) ? '; SameSite=Strict' : '; SameSite=Lax'));
   return cookie.split(';')[0];
 }
 
@@ -74,6 +77,8 @@ test('public startup requires HTTPS and distinct non-default passwords', () => {
   assert.throws(() => createPublicAccess({ PUBLIC_DEPLOYMENT: '1', PUBLIC_URL: 'http://example.test' }), /HTTPS/);
   assert.throws(() => createPublicAccess({ PUBLIC_DEPLOYMENT: '1', PUBLIC_URL: origin + '/path' }), /HTTPS/);
   assert.throws(() => createPublicAccess({ PUBLIC_DEPLOYMENT: '1', PUBLIC_URL: origin, ADMIN_PASSWORD: 'admin123' }), /password|PASSWORD/);
+  assert.throws(() => createPublicAccess({ ...credentials, SETTINGS_PASSWORD: adminPassword }), /SETTINGS_PASSWORD/);
+  assert.equal(createPublicAccess({ ...credentials, SETTINGS_PASSWORD: '' }).settingsReady, false);
 });
 
 test('anonymous access exposes only activity information and cannot manage the event', async () => {
@@ -124,14 +129,17 @@ test('OAuth callbacks require the initiating browser and a one-time state', asyn
   }
 });
 
-test('the confirmed name is saved with the verified avatar, never the submitted avatar or identity', async () => {
+test('the confirmed name and phone are saved with the verified avatar', async () => {
   const before = await (await request('/api/state', { cookie: guestCookie })).json();
   assert.deepEqual(before.wechat.profile, { nickname: '微信测试昵称', avatar: avatarUrl });
   assert.equal(before.selfAttendee, null);
   assert.equal((await request('/checkin', { cookie: guestCookie, wechat: true })).status, 200);
   assert.equal((await request('/api/checkin', { method: 'POST', cookie: guestCookie, body: { name: ' ' } })).status, 400);
+  for (const phone of [undefined, ' ', '12345']) {
+    assert.equal((await request('/api/checkin', { method: 'POST', cookie: guestCookie, body: { name: '测试来宾', phone } })).status, 400);
+  }
   const saved = await request('/api/checkin', { method: 'POST', cookie: guestCookie, body: {
-    name: '测试来宾', nickname: '伪造昵称', avatar: 'https://example.test/forged.png', phone: '12345', openid: 'spoof', source: 'local-form'
+    name: '测试来宾', nickname: '伪造昵称', avatar: 'https://example.test/forged.png', phone: '13800138000', openid: 'spoof', source: 'local-form'
   } });
   assert.equal(saved.status, 200);
   const attendee = (await saved.json()).attendee;
@@ -139,21 +147,23 @@ test('the confirmed name is saved with the verified avatar, never the submitted 
   assert.equal(attendee.avatar, avatarUrl);
   assert.equal(attendee.nickname, '微信测试昵称');
   assert.equal(attendee.openid, undefined);
-  assert.equal(attendee.phone, undefined);
+  assert.equal(attendee.phone, '13800138000');
 
   const ownerState = await (await request('/api/state', { cookie: guestCookie })).json();
   assert.equal(ownerState.selfAttendee.id, guestId);
+  assert.equal(ownerState.selfAttendee.phone, '13800138000');
   assert.deepEqual(ownerState.attendees, []);
   const anonymous = await (await request('/api/state')).json();
   assert.equal(anonymous.selfAttendee, null);
   assert.equal(anonymous.wechat.profile, null);
   assert.doesNotMatch(JSON.stringify(ownerState), /test-openid|test-token|test-app-secret/);
   const authorizedAgain = await authorize('again');
-  const edited = await request('/api/checkin', { method: 'POST', cookie: authorizedAgain, body: { name: '修改姓名' } });
+  const edited = await request('/api/checkin', { method: 'POST', cookie: authorizedAgain, body: { name: '修改姓名', phone: '13900139000' } });
   const result = await edited.json();
   assert.equal(result.existing, true);
   assert.equal(result.attendee.id, guestId);
   assert.equal(result.attendee.checkedInAt, attendee.checkedInAt);
+  assert.equal(result.attendee.phone, '13900139000');
 });
 
 test('staff sessions are server-side and role permissions are distinct', async () => {
@@ -165,7 +175,7 @@ test('staff sessions are server-side and role permissions are distinct', async (
   const admin = await (await request('/api/state', { cookie: adminCookie })).json();
   assert.equal(admin.accessRole, 'admin');
   assert.equal(admin.attendees[0].id, guestId);
-  assert.equal(admin.attendees[0].phone, '');
+  assert.equal(admin.attendees[0].phone, '13900139000');
   assert.match(admin.attendees[0].openid, /^wechat-[a-f0-9]{64}$/);
   assert.equal(admin.config.adminPassword, undefined);
   assert.equal(admin.loginDefaults, undefined);
@@ -182,13 +192,30 @@ test('staff sessions are server-side and role permissions are distinct', async (
   assert.equal((await request('/api/reset', { method: 'POST', cookie: screenCookie, body: { scope: 'all' } })).status, 403);
   assert.equal((await request('/api/config', { method: 'PUT', cookie: screenCookie, body: { eventTitle: '修改' } })).status, 403);
   assert.equal((await request('/api/config', { method: 'PUT', cookie: screenCookie, body: { qrSize: 140 } })).status, 403);
-  const saved = await request('/api/config', { method: 'PUT', cookie: adminCookie, body: { qrSize: 140 } });
+  assert.equal((await request('/api/config', { method: 'PUT', cookie: adminCookie, body: { qrSize: 140 } })).status, 403);
+  assert.equal((await login('settings', adminPassword)).status, 401);
+  assert.equal((await login('settings', screenPassword)).status, 401);
+  const settingsCookie = cookieFrom(await login('settings', settingsPassword), 'settings');
+  const settings = await (await request('/api/state', { cookie: settingsCookie })).json();
+  assert.equal(settings.hasSettingsAccess, true);
+  assert.equal(settings.accessRole, null);
+  assert.deepEqual(settings.attendees, []);
+  assert.equal((await request('/api/export/checkins.xlsx', { cookie: settingsCookie })).status, 403);
+  assert.equal((await request('/api/upload/logo', { method: 'POST', cookie: adminCookie })).status, 403);
+  const logo = new FormData();
+  logo.append('file', new Blob([Buffer.from('test')], { type: 'image/png' }), 'logo.png');
+  const uploaded = await request('/api/upload/logo', { method: 'POST', cookie: settingsCookie, body: logo });
+  assert.equal(uploaded.status, 200);
+  const { url } = await uploaded.json();
+  assert.equal((await request(url, { cookie: settingsCookie })).status, 200);
+  assert.equal((await request(url)).status, 404);
+  const saved = await request('/api/config', { method: 'PUT', cookie: settingsCookie, body: { qrSize: 140 } });
   assert.equal(saved.status, 200);
   assert.equal((await saved.json()).config.qrSize, 140);
   assert.equal((await request('/api/prizes/grand-prize/fixed-winners', {
     method: 'POST', cookie: screenCookie, body: { attendeeId: guestId }
   })).status, 403);
-  assert.equal((await request('/api/config', { method: 'PUT', cookie: adminCookie, from: 'https://other.example.test', body: { qrSize: 88 } })).status, 403);
+  assert.equal((await request('/api/config', { method: 'PUT', cookie: settingsCookie, from: 'https://other.example.test', body: { qrSize: 88 } })).status, 403);
   assert.equal((await request('/api/qrcode.svg', { cookie: screenCookie })).status, 200);
 
   const draw = await request('/api/draw', { method: 'POST', cookie: screenCookie, body: { prizeId: 'grand-prize', count: 1 } });
@@ -216,7 +243,7 @@ test('Socket.IO delivers filtered live updates only to logged-in staff', async (
   const secondGuest = await authorize('second');
   const secondState = await (await request('/api/state', { cookie: secondGuest })).json();
   assert.equal(secondState.selfAttendee, null);
-  const added = await request('/api/checkin', { method: 'POST', cookie: secondGuest, body: { name: '实时签到来宾' } });
+  const added = await request('/api/checkin', { method: 'POST', cookie: secondGuest, body: { name: '实时签到来宾', phone: '13700137000' } });
   assert.equal(added.status, 200);
   const update = await (await request(socketUrl, { cookie: screenCookie })).text();
   assert.match(update, /实时签到来宾/);
@@ -230,7 +257,7 @@ test('Socket.IO delivers filtered live updates only to logged-in staff', async (
 test('a WeChat account without an avatar receives a generated name avatar', async () => {
   const otherGuest = await authorize('no-avatar');
   const guest = await request('/api/checkin', {
-    method: 'POST', cookie: otherGuest, body: { name: '姓名头像来宾', avatar: 'https://example.test/forged.png' }
+    method: 'POST', cookie: otherGuest, body: { name: '姓名头像来宾', phone: '13700137000', avatar: 'https://example.test/forged.png' }
   });
   assert.equal(guest.status, 200);
   const { attendee } = await guest.json();

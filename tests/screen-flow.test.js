@@ -35,6 +35,7 @@ function browser(pathname = '/screen/lottery') {
       setInterval: (fn) => timers.push(fn),
       clearInterval() {}
     },
+    performance: { now: () => 2500 },
     io: () => ({ on: (event, callback) => events.set(event, callback) }),
     CSS: { escape: (value) => value },
     btoa: (value) => Buffer.from(value, 'binary').toString('base64')
@@ -72,7 +73,7 @@ test('check-in and lottery have independent display routes', () => {
   }
 });
 
-test('the separate settings route accepts only an administrator role', () => {
+test('the separate settings route requires its own session', () => {
   const ui = browser('/screen/settings');
   ui.run(`state.loginDefaults = { admin: true };`);
   ui.context.render();
@@ -81,8 +82,15 @@ test('the separate settings route accepts only an administrator role', () => {
   ui.selectors.set('#settingsForm', { addEventListener() {} });
   ui.run(`state.accessRole = 'admin';`);
   ui.context.render();
-  assert.match(ui.app.innerHTML, /id="settingsForm"|name="qrSize"/);
+  assert.match(ui.app.innerHTML, /大屏设置密码/);
+  assert.doesNotMatch(ui.app.innerHTML, /id="settingsForm"/);
+  ui.run(`state.accessRole = null; state.hasSettingsAccess = true;`);
+  ui.context.render();
+  assert.match(ui.app.innerHTML, /id="settingsForm"/);
+  assert.match(ui.app.innerHTML, /name="qrSize"/);
   assert.match(ui.app.innerHTML, /name="logoX"/);
+  assert.match(ui.app.innerHTML, /退出设置/);
+  assert.doesNotMatch(ui.app.innerHTML, /name="adminPassword"/);
 });
 
 test('only new arrivals animate, both in the live check-in list and the admin table', () => {
@@ -103,17 +111,61 @@ test('only new arrivals animate, both in the live check-in list and the admin ta
   assert.match(admin.app.innerHTML, /<tr class="checkin-arrival" data-checkin-id="new"/);
 });
 
+test('the check-in sphere projects rotating avatars with depth', () => {
+  const ui = browser('/screen/checkin');
+  const sphere = ui.context.spatialAvatarPoints(18, 'sphere');
+  assert.equal(sphere.length, 18);
+  assert.ok(sphere.every(({ x, y, z }) => Math.abs(Math.hypot(x, y, z) - 1) < 1e-10));
+  const point = { x: 1, y: 0, z: 0 };
+  const side = ui.context.projectAvatarPoint(point, 0, 1);
+  const front = ui.context.projectAvatarPoint(point, -1, 0);
+  const back = ui.context.projectAvatarPoint(point, 1, 0);
+  assert.notEqual(side.x, front.x);
+  assert.ok(front.scale > back.scale);
+  assert.ok(front.opacity > back.opacity);
+  assert.ok(front.depth > back.depth);
+  assert.ok(front.scale > 1.5 && back.scale < 0.8);
+});
+
+test('a spherical draw uses the selected prize animation instead of the check-in wall layout', () => {
+  const ui = browser();
+  const classes = new Set();
+  const stage = {
+    clientWidth: 1440,
+    clientHeight: 900,
+    classList: {
+      add: (...names) => names.forEach((name) => classes.add(name)),
+      remove: (...names) => names.forEach((name) => classes.delete(name)),
+      toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name)
+    },
+    style: { setProperty() {} },
+    querySelectorAll: () => []
+  };
+  ui.selectors.set('#avatarStage', stage);
+  ui.run("state.config.wallMode = 'wall'; drawState.rolling = true;");
+  ui.context.paintAvatarStage();
+  assert.ok(classes.has('sphere'));
+  assert.ok(classes.has('is-spatial'));
+  assert.match(stage.innerHTML, /data-attendee-id="a"/);
+  const highlighted = new Set();
+  ui.selectors.set('[data-attendee-id="a"]', { classList: { add: (name) => highlighted.add(name) } });
+  ui.context.highlightRollingCandidate({ id: 'a' });
+  assert.deepEqual([...highlighted], ['draw-hot']);
+});
+
 test('the preset editor separates an empty selection from saved names', () => {
   const ui = browser('/admin');
   const empty = ui.run('renderFixedWinnerEditor(state.prizes[0])');
   assert.match(empty, /内定人员（0）/);
   assert.match(empty, /value="" disabled selected/);
   assert.match(empty, /暂无内定人员/);
+  assert.match(empty, /添加内定/);
   assert.doesNotMatch(empty, /data-remove-fixed/);
   ui.run(`state.prizes[0].fixedWinnerIds = ['a'];`);
   const saved = ui.run('renderFixedWinnerEditor(state.prizes[0])');
   assert.match(saved, /内定人员（1）/);
   assert.match(saved, /data-remove-fixed="a"/);
+  assert.match(saved, /删除<\/button>/);
   assert.doesNotMatch(saved, /<option value="a"/);
 });
 
@@ -148,7 +200,7 @@ test('starting only animates; stop draws once using the frozen prize and count',
   ui.context.startDraw();
   ui.context.startDraw();
   assert.equal(calls.length, 0);
-  assert.equal(ui.timers.length, 2);
+  assert.equal(ui.timers.length, 1);
   assert.equal(ui.run('drawState.rolling'), true);
   assert.equal(ui.run('state.winners.length'), 0);
 

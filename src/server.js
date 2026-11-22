@@ -10,7 +10,7 @@ import multer from 'multer';
 import QRCode from 'qrcode';
 import { Server } from 'socket.io';
 import writeExcelFile from 'write-excel-file/node';
-import { createPublicAccess, createStaffSessions } from './public-access.js';
+import { createPublicAccess, createStaffSessions, readToken } from './public-access.js';
 import { createWechatCheckin } from './wechat-checkin.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,15 +23,25 @@ const EXAMPLE_DATA_FILE = path.join(DATA_DIR, 'store.example.json');
 const UPLOAD_DIR = path.join(ROOT_DIR, 'assets', 'uploads');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const avatarFilePattern = /^avatar-(?:public-[a-f0-9]{64}-)?[a-f0-9-]+\.(jpg|png|webp|gif)$/;
+const visitorCookie = 'checkin-visitor';
 
 loadEnvFile(ENV_FILE);
 
 const PORT = Number(process.env.PORT || 3000);
-const publicAccess = createPublicAccess(process.env);
+const settingsAccess = createStaffSessions({ secure: process.env.PUBLIC_DEPLOYMENT === '1', name: 'settings' });
+const publicAccess = createPublicAccess(process.env, settingsAccess);
 const staffAccess = publicAccess || createStaffSessions({ secure: false });
-const publicWechat = publicAccess && createWechatCheckin({
-  origin: publicAccess.origin, env: process.env, fetchJson: fetchWechatJson
-});
+const lanSettingsPassword = process.env.SETTINGS_PASSWORD || 'settings123';
+let wechatOrigin = publicAccess?.origin;
+if (!wechatOrigin && process.env.PUBLIC_URL) {
+  try {
+    const url = new URL(process.env.PUBLIC_URL);
+    if (url.protocol === 'https:' && url.pathname === '/' && !url.search && !url.hash && !url.username && !url.password) {
+      wechatOrigin = url.origin;
+    }
+  } catch { /* The check-in page reports missing HTTPS configuration. */ }
+}
+const wechatCheckin = wechatOrigin && createWechatCheckin({ origin: wechatOrigin, env: process.env, fetchJson: fetchWechatJson });
 const HOST = publicAccess ? '127.0.0.1' : '0.0.0.0';
 const qrOptions = { type: 'svg', width: 420, margin: 1, errorCorrectionLevel: 'M' };
 const publicCheckinQr = publicAccess ? await QRCode.toString(`${publicAccess.origin}/checkin`, qrOptions) : null;
@@ -41,12 +51,12 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, publicAccess ? {
+const io = new Server(server, {
   allowRequest(req, callback) {
     const origin = req.headers.origin;
-    callback(null, Boolean(publicAccess.session(req) && (!origin || origin === publicAccess.origin)));
+    callback(null, Boolean(staffAccess.session(req) && (!publicAccess || !origin || origin === publicAccess.origin)));
   }
-} : {});
+});
 
 if (publicAccess) {
   app.disable('x-powered-by');
@@ -66,7 +76,8 @@ if (publicAccess) {
       'Cache-Control': 'private, no-store',
       'Content-Security-Policy': "default-src 'none'; sandbox"
     });
-    if (!publicAccess.session(req)) {
+    const settingsAsset = /^\/(?:logo|music)-\d+-[a-f0-9]{8}\.[a-z0-9_-]+$/i.test(req.path) && settingsAccess.session(req);
+    if (!publicAccess.session(req) && !settingsAsset) {
       res.sendStatus(404);
       return;
     }
@@ -161,7 +172,10 @@ function cleanText(value, max = 120) {
 }
 
 function cleanPhone(value) {
-  return String(value ?? '').replace(/[^\d+\-\s]/g, '').trim().slice(0, 32);
+  const phone = typeof value === 'string' && value.length <= 32 ? value.trim().replace(/[\s-]+/g, '') : '';
+  if (/^1[3-9]\d{9}$/.test(phone)) return phone;
+  if (phone.startsWith('+86')) return /^\+861[3-9]\d{9}$/.test(phone) ? phone.slice(3) : '';
+  return /^\+[1-9]\d{7,14}$/.test(phone) ? phone : '';
 }
 
 function safePosition(value, fallback) {
@@ -184,39 +198,45 @@ function publicConfig(config) {
   return rest;
 }
 
-function publicState(req, store = loadStore()) {
-  if (publicAccess) {
-    const role = publicAccess.session(req)?.role;
-    const config = { ...publicConfig(store.config), checkinMode: 'wechat' };
-    const profile = publicWechat.profile(req);
-    const self = profile && store.attendees.find((attendee) => attendee.openid === profile.id);
-    return {
-      deployment: 'public',
-      accessRole: role || null,
-      config: role ? config : { eventTitle: config.eventTitle, subtitle: config.subtitle, checkinMode: 'wechat' },
-      attendees: role === 'admin' ? store.attendees : role === 'screen' ? store.attendees.map(screenAttendee) : [],
-      prizes: role === 'admin' ? store.prizes : role === 'screen' ? store.prizes.map(screenPrize) : [],
-      winners: role === 'admin' ? store.winners : role === 'screen' ? store.winners.map(screenWinner) : [],
-      selfAttendee: self ? screenAttendee(self) : null,
-      wechat: {
-        ready: publicWechat.ready,
-        profile: profile ? { nickname: profile.nickname, avatar: profile.avatar } : null
-      },
-      checkinUrl: `${publicAccess.origin}/checkin`
-    };
-  }
+function publicState(req, store = loadStore(), includeSelf = true) {
+  const role = staffAccess.session(req)?.role;
+  const checkinMode = publicAccess ? 'wechat' : store.config.checkinMode;
+  const config = { ...publicConfig(store.config), checkinMode };
+  const profile = includeSelf && checkinMode === 'wechat' ? wechatCheckin?.profile(req) : null;
+  const visitor = includeSelf && checkinMode !== 'wechat' ? readToken(req, visitorCookie) : '';
+  const self = findCheckinAttendee(store, profile, visitor);
   return {
-    config: publicConfig(store.config),
-    attendees: store.attendees,
-    prizes: store.prizes,
-    winners: store.winners,
-    loginDefaults: {
+    ...(publicAccess ? { deployment: 'public' } : { loginDefaults: {
       admin: store.config.adminPassword === 'admin123',
       screen: store.config.screenPassword === 'screen123'
+    } }),
+    accessRole: role || null,
+    config: role || settingsAccess.session(req) ? config : { eventTitle: config.eventTitle, subtitle: config.subtitle, checkinMode },
+    attendees: role === 'admin' ? store.attendees : role === 'screen' ? store.attendees.map(screenAttendee) : [],
+    prizes: role === 'admin' ? store.prizes : role === 'screen' ? store.prizes.map(screenPrize) : [],
+    winners: role === 'admin' ? store.winners : role === 'screen' ? store.winners.map(screenWinner) : [],
+    selfAttendee: self ? ownAttendee(self) : null,
+    wechat: {
+      ready: Boolean(wechatCheckin?.ready),
+      profile: profile ? { nickname: profile.nickname, avatar: profile.avatar } : null
     },
-    checkinUrl: `${baseUrl(req)}/checkin`,
-    wechat: wechatOAuthStatus(req)
+    checkinUrl: `${baseUrl(req)}/checkin`
   };
+}
+
+function findCheckinAttendee(store, profile, visitor) {
+  const openid = profile?.id || (visitor && localVisitorId(visitor));
+  if (!openid) return null;
+  return store.attendees.find((item) => item.openid === openid)
+    || (profile && store.attendees.find((item) => item.openid === profile.openid && item.source === 'wechat-oauth'));
+}
+
+function localVisitorId(visitor) {
+  return `local-${crypto.createHash('sha256').update(visitor).digest('hex')}`;
+}
+
+function ownAttendee(attendee) {
+  return { ...screenAttendee(attendee), phone: cleanPhone(attendee.phone) };
 }
 
 function screenAttendee({ id, name, nickname, company, avatar, checkedInAt }) {
@@ -234,30 +254,26 @@ function screenWinner({ phone, fixed, ...winner }) {
 function baseUrl(req) {
   if (publicAccess) return publicAccess.origin;
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '');
-  const host = req.get('host');
+  const host = req.headers.host;
   if (/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host || '')) {
     const [firstLanUrl] = lanUrls(PORT);
     if (firstLanUrl) return firstLanUrl;
   }
-  return `${req.protocol}://${host}`;
+  return `${req.protocol || 'http'}://${host}`;
 }
 
-function emitState(req, eventName, payload) {
-  if (publicAccess) {
-    const store = loadStore();
-    for (const socket of io.sockets.sockets.values()) {
-      if (!publicAccess.session(socket.request)) {
-        socket.disconnect(true);
-        continue;
-      }
-      socket.emit('state', publicState(socket.request, store));
-      if (eventName === 'checkin:new') socket.emit(eventName, screenAttendee(payload));
+function emitState(eventName, payload) {
+  const store = loadStore();
+  for (const socket of io.sockets.sockets.values()) {
+    const role = staffAccess.session(socket.request)?.role;
+    if (!role) {
+      socket.disconnect(true);
+      continue;
     }
-    return;
+    socket.emit('state', publicState(socket.request, store, false));
+    if (eventName === 'checkin:new') socket.emit(eventName, screenAttendee(payload));
+    else if (!publicAccess && role === 'admin' && eventName) socket.emit(eventName, payload);
   }
-  const state = publicState(req);
-  io.emit('state', state);
-  if (eventName) io.emit(eventName, payload);
 }
 
 function isAlreadyWinner(store, attendeeId) {
@@ -304,63 +320,8 @@ function avatarDataUri(name, color) {
   return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
 }
 
-function getWechatOAuthConfig(req) {
-  const publicUrl = cleanText(process.env.PUBLIC_URL, 500).replace(/\/$/, '');
-  const appId = cleanText(process.env.WECHAT_APP_ID, 120);
-  const appSecret = cleanText(process.env.WECHAT_APP_SECRET, 180);
-  const scope = cleanText(process.env.WECHAT_OAUTH_SCOPE, 40) || 'snsapi_userinfo';
-  const callbackBaseUrl = publicUrl || baseUrl(req);
-  return {
-    appId,
-    appSecret,
-    scope,
-    publicUrl,
-    callbackUrl: `${callbackBaseUrl}/wechat/oauth/callback`,
-    configured: Boolean(appId && appSecret),
-    ready: Boolean(appId && appSecret && publicUrl)
-  };
-}
-
-function wechatOAuthStatus(req) {
-  const config = getWechatOAuthConfig(req);
-  return {
-    configured: config.configured,
-    ready: config.ready,
-    scope: config.scope,
-    callbackUrl: config.callbackUrl,
-    needsPublicUrl: config.configured && !config.publicUrl
-  };
-}
-
 function isWechatBrowser(req) {
   return /MicroMessenger/i.test(req.get('user-agent') || '');
-}
-
-function saveWechatAttendee(req, userInfo) {
-  const store = loadStore();
-  const now = new Date().toISOString();
-  const openid = cleanText(userInfo.openid, 160);
-  if (!openid) throw new Error('微信授权没有返回 openid');
-  const nickname = cleanText(userInfo.nickname, 80) || '微信用户';
-  const avatar = cleanText(userInfo.headimgurl, 1000) || avatarDataUri(nickname, '#b91c1c');
-  const existing = store.attendees.find((item) => item.openid === openid);
-  const attendee = {
-    id: existing?.id || crypto.randomUUID(),
-    openid,
-    nickname,
-    avatar,
-    name: nickname,
-    company: '',
-    phone: '',
-    source: 'wechat-oauth',
-    checkedInAt: existing?.checkedInAt || now,
-    updatedAt: existing ? now : undefined
-  };
-  if (existing) Object.assign(existing, attendee);
-  else store.attendees.push(attendee);
-  saveStore(store);
-  emitState(req, existing ? null : 'checkin:new', attendee);
-  return existing || attendee;
 }
 
 async function fetchWechatJson(url) {
@@ -412,11 +373,27 @@ async function sendWorkbook(res, filename, rows, columns) {
 
 app.get('/api/state', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ ...publicState(req), accessRole: staffAccess.session(req)?.role || null });
+  res.json({
+    ...publicState(req),
+    accessRole: staffAccess.session(req)?.role || null,
+    hasSettingsAccess: Boolean(settingsAccess.session(req))
+  });
 });
 
 app.post('/api/login', (req, res) => {
   const { role: requestedRole, password } = req.body || {};
+  if (requestedRole === 'settings') {
+    if (!publicAccess && !allowLanOrigin(req, res)) return;
+    const config = publicAccess ? null : loadStore().config;
+    const ready = publicAccess ? publicAccess.settingsReady
+      : ![config.adminPassword, config.screenPassword].includes(lanSettingsPassword);
+    if (!ready) return res.status(503).json({ message: '请在服务端配置独立的设置密码' });
+    const valid = publicAccess ? publicAccess.matchesPassword('settings', password) : password === lanSettingsPassword;
+    if (!valid) return res.status(401).json({ message: '设置密码不正确' });
+    settingsAccess.endSession(req);
+    settingsAccess.startSession(res, 'settings');
+    return res.json({ ok: true, role: 'settings', path: '/screen/settings' });
+  }
   const role = requestedRole === 'screen' ? 'screen' : 'admin';
   const valid = publicAccess ? publicAccess.matchesPassword(role, password)
     : cleanText(password, 80) === loadStore().config[role === 'admin' ? 'adminPassword' : 'screenPassword'];
@@ -425,14 +402,19 @@ app.post('/api/login', (req, res) => {
     return;
   }
   const previousSession = staffAccess.endSession(req);
-  if (publicAccess && previousSession) io.in(previousSession).disconnectSockets(true);
+  if (previousSession) io.in(previousSession).disconnectSockets(true);
   staffAccess.startSession(res, role);
   res.json({ ok: true, role, path: role === 'admin' ? '/admin' : '/screen/checkin' });
 });
 
 app.post('/api/logout', (req, res) => {
+  if (req.body?.role === 'settings') {
+    if (!publicAccess && !allowLanOrigin(req, res)) return;
+    settingsAccess.endSession(req, res);
+    return res.json({ ok: true });
+  }
   const id = staffAccess.endSession(req, res);
-  if (publicAccess && id) io.in(id).disconnectSockets(true);
+  if (id) io.in(id).disconnectSockets(true);
   res.json({ ok: true });
 });
 
@@ -445,95 +427,66 @@ app.get('/api/qrcode.svg', async (req, res, next) => {
   }
 });
 
+function startVisitor(res) {
+  const id = crypto.randomBytes(32).toString('hex');
+  res.cookie(visitorCookie, id, { httpOnly: true, sameSite: 'lax', path: '/', maxAge: 365 * 24 * 60 * 60 * 1000 });
+  return id;
+}
+
 app.get('/wechat/oauth/start', (req, res) => {
-  if (publicWechat) {
-    if (!isWechatBrowser(req)) return res.redirect('/checkin?wechat=outside');
-    if (!publicAccess.allowWechatStart(req, res)) return;
-    return publicWechat.start(req, res);
+  if (!wechatCheckin?.ready || (!publicAccess && loadStore().config.checkinMode !== 'wechat')) {
+    return res.redirect('/checkin?wechat=not-ready');
   }
-  const config = getWechatOAuthConfig(req);
-  if (!config.ready) {
-    res.redirect('/checkin?wechat=not-ready');
-    return;
-  }
-  const params = new URLSearchParams({
-    appid: config.appId,
-    redirect_uri: config.callbackUrl,
-    response_type: 'code',
-    scope: config.scope,
-    state: `checkin-${Date.now()}`
-  });
-  res.redirect(`https://open.weixin.qq.com/connect/oauth2/authorize?${params.toString()}#wechat_redirect`);
+  if (!isWechatBrowser(req)) return res.redirect('/checkin?wechat=outside');
+  if (publicAccess && !publicAccess.allowWechatStart(req, res)) return;
+  return wechatCheckin.start(req, res);
 });
 
-app.get('/wechat/oauth/callback', async (req, res, next) => {
-  if (publicWechat) return publicWechat.callback(req, res);
-  try {
-    const config = getWechatOAuthConfig(req);
-    const code = cleanText(req.query.code, 180);
-    if (!config.ready || !code) {
-      res.redirect('/checkin?wechat=failed');
-      return;
-    }
-    const tokenParams = new URLSearchParams({
-      appid: config.appId,
-      secret: config.appSecret,
-      code,
-      grant_type: 'authorization_code'
-    });
-    const token = await fetchWechatJson(`https://api.weixin.qq.com/sns/oauth2/access_token?${tokenParams.toString()}`);
-    let userInfo = {
-      openid: token.openid,
-      nickname: '微信用户',
-      headimgurl: ''
-    };
-    if (config.scope === 'snsapi_userinfo') {
-      const userParams = new URLSearchParams({
-        access_token: token.access_token,
-        openid: token.openid,
-        lang: 'zh_CN'
-      });
-      userInfo = await fetchWechatJson(`https://api.weixin.qq.com/sns/userinfo?${userParams.toString()}`);
-    }
-    const attendee = saveWechatAttendee(req, userInfo);
-    res.redirect(`/checkin?checked=1&attendee=${encodeURIComponent(attendee.id)}`);
-  } catch (error) {
-    next(error);
+app.get('/wechat/oauth/callback', (req, res) => {
+  if (!wechatCheckin || (!publicAccess && loadStore().config.checkinMode !== 'wechat')) {
+    return res.redirect('/checkin?wechat=failed');
   }
+  return wechatCheckin.callback(req, res);
 });
 
 app.get('/checkin', (req, res, next) => {
-  if (publicWechat) {
-    res.set('Cache-Control', 'no-store');
-    if (req.method === 'GET' && publicWechat.ready && !req.query.wechat && isWechatBrowser(req) && !publicWechat.profile(req)) {
+  res.set('Cache-Control', 'no-store');
+  if (req.method !== 'GET') return next();
+  if (publicAccess || loadStore().config.checkinMode === 'wechat') {
+    if (wechatCheckin?.ready && !req.query.wechat && isWechatBrowser(req) && !wechatCheckin.profile(req)) {
       return res.redirect('/wechat/oauth/start');
     }
-    return next();
-  }
-  const config = getWechatOAuthConfig(req);
-  if (loadStore().config.checkinMode === 'wechat' && !req.query.checked && config.ready && (isWechatBrowser(req) || req.query.oauth === '1')) {
-    res.redirect('/wechat/oauth/start');
-    return;
+  } else if (!readToken(req, visitorCookie)) {
+    startVisitor(res);
   }
   next();
 });
+
+function allowLanOrigin(req, res, allowedOrigin) {
+  const origin = req.get('origin');
+  if (!publicAccess && origin && origin !== `${req.protocol}://${req.get('host')}` && origin !== allowedOrigin) {
+    res.status(403).json({ message: '请从活动页面发起请求' });
+    return false;
+  }
+  return true;
+}
 
 function requireAdminSession(req, res, next) {
   res.set('Cache-Control', 'no-store');
   const role = staffAccess.session(req)?.role;
-  if (role !== 'admin') {
-    res.status(role ? 403 : 401).json({ message: '请使用后台密码登录' });
-    return;
-  }
-  const origin = req.get('origin');
-  if (!publicAccess && origin && origin !== `${req.protocol}://${req.get('host')}`) {
-    res.status(403).json({ message: '请从活动页面发起请求' });
-    return;
-  }
-  next();
+  if (role !== 'admin') return res.status(role ? 403 : 401).json({ message: '请使用后台密码登录' });
+  if (allowLanOrigin(req, res)) next();
 }
 
-app.put('/api/config', requireAdminSession, (req, res) => {
+function requireSettingsSession(req, res, next) {
+  res.set('Cache-Control', 'no-store');
+  if (!settingsAccess.session(req)) {
+    return res.status(staffAccess.session(req) ? 403 : 401).json({ message: '请使用大屏设置密码登录' });
+  }
+  if (allowLanOrigin(req, res)) next();
+}
+
+app.put('/api/config', requireSettingsSession, (req, res) => {
   const store = loadStore();
   const body = req.body || {};
   const previous = store.config;
@@ -553,8 +506,18 @@ app.put('/api/config', requireAdminSession, (req, res) => {
   if ('logoPosition' in body) next.logoPosition = safePosition(body.logoPosition, next.logoPosition);
   if ('qrPosition' in body) next.qrPosition = safePosition(body.qrPosition, next.qrPosition);
   if ('qrSize' in body) next.qrSize = safeNumber(body.qrSize, next.qrSize || 106, 88, 280);
-  if (!publicAccess && cleanText(body.adminPassword, 80)) next.adminPassword = cleanText(body.adminPassword, 80);
-  if (!publicAccess && cleanText(body.screenPassword, 80)) next.screenPassword = cleanText(body.screenPassword, 80);
+  if (!publicAccess) {
+    const adminPassword = cleanText(body.adminPassword, 80);
+    const screenPassword = cleanText(body.screenPassword, 80);
+    if ((adminPassword || screenPassword) && staffAccess.session(req)?.role !== 'admin') {
+      return res.status(403).json({ message: '修改后台或大屏密码还需登录后台' });
+    }
+    if ([adminPassword, screenPassword].includes(lanSettingsPassword)) {
+      return res.status(400).json({ message: '后台和大屏密码须与设置密码不同' });
+    }
+    if (adminPassword) next.adminPassword = adminPassword;
+    if (screenPassword) next.screenPassword = screenPassword;
+  }
   store.config = next;
   saveStore(store);
   if (!publicAccess) {
@@ -564,15 +527,16 @@ app.put('/api/config', requireAdminSession, (req, res) => {
       staffAccess.startSession(res, 'admin');
     }
   }
-  emitState(req, 'config:update', publicConfig(next));
+  emitState('config:update', publicConfig(next));
   res.json(publicState(req, store));
 });
 
 app.post('/api/upload/:kind', (req, res, next) => {
-  if (publicAccess && !['logo', 'music', 'prize'].includes(req.params.kind)) {
+  if (!['logo', 'music', 'prize'].includes(req.params.kind)) {
     res.status(400).json({ message: '不支持的上传类型' });
     return;
   }
+  if (req.params.kind !== 'prize') return requireSettingsSession(req, res, next);
   next();
 }, upload.single('file'), (req, res) => {
   if (!req.file) {
@@ -608,23 +572,29 @@ app.post('/api/checkin/avatar', (req, res, next) => {
 });
 
 app.post('/api/checkin', (req, res) => {
-  const profile = publicWechat?.profile(req);
-  if (publicWechat && !profile) {
+  res.set('Cache-Control', 'no-store');
+  const store = loadStore();
+  const wechatMode = publicAccess || store.config.checkinMode === 'wechat';
+  if (!allowLanOrigin(req, res, wechatOrigin)) return;
+  const profile = wechatMode ? wechatCheckin?.profile(req) : null;
+  if (wechatMode && !profile) {
     res.status(401).json({ message: '请重新授权微信后签到' });
     return;
   }
-  const store = loadStore();
   const now = new Date().toISOString();
   const body = req.body || {};
-  const name = cleanText(profile && typeof body.name !== 'string' ? '' : body.name, 40);
+  const name = typeof body.name === 'string' ? cleanText(body.name, 40) : '';
   if (!name) {
     res.status(400).json({ message: '请填写姓名' });
     return;
   }
-  const openid = profile?.id || cleanText(body.openid, 160) || cleanText(body.visitorId, 160) || `local-${crypto.randomUUID()}`;
-  const phone = profile ? '' : cleanPhone(body.phone);
-  const existing = store.attendees.find((item) => item.openid === openid || (phone && item.phone === phone));
-  const source = profile ? 'wechat-oauth' : cleanText(body.source, 30) || 'local-form';
+  if (typeof body.phone !== 'string' || !body.phone.trim()) return res.status(400).json({ message: '请填写手机号' });
+  const phone = cleanPhone(body.phone);
+  if (!phone) return res.status(400).json({ message: '请输入有效的手机号' });
+  const visitor = profile ? '' : readToken(req, visitorCookie) || startVisitor(res);
+  const openid = profile?.id || localVisitorId(visitor);
+  const existing = findCheckinAttendee(store, profile, visitor);
+  const source = profile ? 'wechat-oauth' : 'local-form';
   let avatar = profile ? profile.avatar : cleanText(body.avatar, 5000);
   if (source === 'local-form' && avatar) {
     const filename = avatar.slice('/uploads/'.length);
@@ -640,8 +610,8 @@ app.post('/api/checkin', (req, res) => {
     nickname: (profile ? cleanText(profile.nickname, 60) : cleanText(body.nickname, 60)) || name,
     avatar,
     name,
-    company: profile ? '' : body.company === undefined ? existing?.company || '' : cleanText(body.company, 80),
-    phone: !profile && body.phone === undefined ? existing?.phone || '' : phone,
+    company: profile || body.company === undefined ? existing?.company || '' : cleanText(body.company, 80),
+    phone,
     source,
     checkedInAt: now
   };
@@ -654,11 +624,11 @@ app.post('/api/checkin', (req, res) => {
     saved = attendee;
   }
   saveStore(store);
-  emitState(req, existing ? null : 'checkin:new', saved);
-  res.json({ ok: true, attendee: publicAccess ? screenAttendee(saved) : saved, existing: Boolean(existing) });
+  emitState(existing ? null : 'checkin:new', saved);
+  res.json({ ok: true, attendee: ownAttendee(saved), existing: Boolean(existing) });
 });
 
-app.get('/api/attendees', (req, res) => {
+app.get('/api/attendees', requireAdminSession, (req, res) => {
   res.json(loadStore().attendees);
 });
 
@@ -668,7 +638,7 @@ app.delete('/api/attendees/:id', (req, res) => {
   store.attendees = store.attendees.filter((item) => item.id !== req.params.id);
   store.winners = store.winners.filter((item) => item.attendeeId !== req.params.id);
   saveStore(store);
-  emitState(req, 'attendee:delete', { id: req.params.id });
+  emitState('attendee:delete', { id: req.params.id });
   res.json({ ok: true, removed: before - store.attendees.length });
 });
 
@@ -678,7 +648,7 @@ app.post('/api/demo/seed', (req, res) => {
   const additions = demoAttendees().filter((item) => !existing.has(item.openid));
   store.attendees.push(...additions);
   saveStore(store);
-  emitState(req, 'demo:seed', { count: additions.length });
+  emitState('demo:seed', { count: additions.length });
   res.json({ ok: true, count: additions.length });
 });
 
@@ -699,7 +669,7 @@ app.post('/api/prizes', (req, res) => {
   };
   store.prizes.push(prize);
   saveStore(store);
-  emitState(req, 'prize:create', prize);
+  emitState('prize:create', prize);
   res.json(prize);
 });
 
@@ -716,7 +686,7 @@ app.put('/api/prizes/:id', (req, res) => {
   if ('imageUrl' in req.body) prize.imageUrl = cleanText(req.body.imageUrl, 500);
   if ('animation' in req.body) prize.animation = ['orbit', 'sphere', 'wall', 'text'].includes(req.body.animation) ? req.body.animation : prize.animation;
   saveStore(store);
-  emitState(req, 'prize:update', prize);
+  emitState('prize:update', prize);
   res.json(prize);
 });
 
@@ -734,7 +704,7 @@ function updateFixedWinners(req, res, add) {
     prize.fixedWinnerIds = prize.fixedWinnerIds.filter((id) => id !== attendeeId);
   }
   saveStore(store);
-  emitState(req, 'prize:update', prize);
+  emitState('prize:update', prize);
   res.json({ fixedWinnerIds: prize.fixedWinnerIds });
 }
 
@@ -746,11 +716,14 @@ app.delete('/api/prizes/:id', (req, res) => {
   store.prizes = store.prizes.filter((item) => item.id !== req.params.id);
   store.winners = store.winners.filter((item) => item.prizeId !== req.params.id);
   saveStore(store);
-  emitState(req, 'prize:delete', { id: req.params.id });
+  emitState('prize:delete', { id: req.params.id });
   res.json({ ok: true });
 });
 
 app.post('/api/draw', (req, res) => {
+  const role = staffAccess.session(req)?.role;
+  if (!role) return res.status(401).json({ message: '请先登录大屏' });
+  if (!allowLanOrigin(req, res, wechatOrigin)) return;
   const store = loadStore();
   const prize = store.prizes.find((item) => item.id === req.body.prizeId);
   if (!prize) {
@@ -798,8 +771,8 @@ app.post('/api/draw', (req, res) => {
   }));
   store.winners.push(...winners);
   saveStore(store);
-  emitState(req, 'draw:complete', { prize, winners });
-  const isScreen = publicAccess?.session(req)?.role === 'screen';
+  emitState('draw:complete', { prize, winners });
+  const isScreen = role === 'screen';
   res.json({
     prize: isScreen ? screenPrize(prize) : prize,
     winners: isScreen ? winners.map(screenWinner) : winners,
@@ -807,7 +780,7 @@ app.post('/api/draw', (req, res) => {
   });
 });
 
-app.get('/api/winners', (req, res) => {
+app.get('/api/winners', requireAdminSession, (req, res) => {
   res.json(loadStore().winners);
 });
 
@@ -815,13 +788,17 @@ app.delete('/api/winners/:id', (req, res) => {
   const store = loadStore();
   store.winners = store.winners.filter((winner) => winner.id !== req.params.id);
   saveStore(store);
-  emitState(req, 'winner:delete', { id: req.params.id });
+  emitState('winner:delete', { id: req.params.id });
   res.json({ ok: true });
 });
 
 app.post('/api/reset', (req, res) => {
-  const store = loadStore();
   const scope = req.body.scope;
+  if (scope === 'all' && (!settingsAccess.session(req) || staffAccess.session(req)?.role !== 'admin')) {
+    return res.status(403).json({ message: '恢复全部设置需要同时登录后台和大屏设置' });
+  }
+  if (scope === 'all' && !allowLanOrigin(req, res)) return;
+  const store = loadStore();
   if (scope === 'attendees') {
     store.attendees = [];
     store.winners = [];
@@ -838,11 +815,11 @@ app.post('/api/reset', (req, res) => {
     return;
   }
   saveStore(store);
-  emitState(req, 'state:reset', { scope });
+  emitState('state:reset', { scope });
   res.json({ ok: true });
 });
 
-app.get('/api/export/checkins.xlsx', async (req, res, next) => {
+app.get('/api/export/checkins.xlsx', requireAdminSession, async (req, res, next) => {
   try {
     const rows = loadStore().attendees.map((item, index) => ({ index: index + 1, ...item }));
     await sendWorkbook(res, `签到数据-${dateStamp()}.xlsx`, rows, [
@@ -860,7 +837,7 @@ app.get('/api/export/checkins.xlsx', async (req, res, next) => {
   }
 });
 
-app.get('/api/export/winners.xlsx', async (req, res, next) => {
+app.get('/api/export/winners.xlsx', requireAdminSession, async (req, res, next) => {
   try {
     const rows = loadStore().winners.map((item, index) => ({ index: index + 1, ...item }));
     await sendWorkbook(res, `中奖名单-${dateStamp()}.xlsx`, rows, [
@@ -893,22 +870,15 @@ function formatDate(value) {
 }
 
 io.on('connection', (socket) => {
-  if (publicAccess) {
-    const session = publicAccess.session(socket.request);
-    if (!session) {
-      socket.disconnect(true);
-      return;
-    }
-    socket.join(session.id);
-    const expiry = setTimeout(() => socket.disconnect(true), session.expiresAt - Date.now());
-    socket.on('disconnect', () => clearTimeout(expiry));
-    socket.emit('state', publicState(socket.request));
+  const session = staffAccess.session(socket.request);
+  if (!session) {
+    socket.disconnect(true);
     return;
   }
-  socket.emit('state', publicState({
-    protocol: 'http',
-    get: () => `localhost:${PORT}`
-  }));
+  socket.join(session.id);
+  const expiry = setTimeout(() => socket.disconnect(true), session.expiresAt - Date.now());
+  socket.on('disconnect', () => clearTimeout(expiry));
+  socket.emit('state', publicState(socket.request, loadStore(), false));
 });
 
 app.get(/.*/, (req, res) => {

@@ -90,6 +90,7 @@ export function createWechatCheckin({ origin, env, fetchJson }) {
         const session = newToken();
         profiles.set(session, {
           id: `wechat-${createHash('sha256').update(`${appId}:${openid}`).digest('hex')}`,
+          openid,
           nickname: typeof user.nickname === 'string' ? user.nickname.trim().slice(0, 60) : '',
           avatar: avatarUrl(user.headimgurl),
           expiresAt: Date.now() + profileLifetime
