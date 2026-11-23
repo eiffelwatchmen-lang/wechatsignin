@@ -61,14 +61,14 @@ export function createPublicAccess(env, settingsAccess) {
     throw new Error('PUBLIC_DEPLOYMENT=1 requires PUBLIC_URL to be an HTTPS origin.');
   }
   const passwords = { admin: env.ADMIN_PASSWORD, screen: env.SCREEN_PASSWORD };
-  if (Object.values(passwords).some((value) => !value || value.length < 16 || value.length > 80 || value.trim() !== value)
+  if (Object.values(passwords).some((value) => !value || value.length < 12 || value.length > 80 || value.trim() !== value)
       || passwords.admin === passwords.screen) {
-    throw new Error('Set distinct ADMIN_PASSWORD and SCREEN_PASSWORD values of 16-80 characters.');
+    throw new Error('Set distinct ADMIN_PASSWORD and SCREEN_PASSWORD values of 12-80 characters.');
   }
   if (env.SETTINGS_PASSWORD) {
     const password = env.SETTINGS_PASSWORD;
-    if (password.length < 16 || password.length > 80 || password.trim() !== password || Object.values(passwords).includes(password)) {
-      throw new Error('Set a distinct SETTINGS_PASSWORD value of 16-80 characters.');
+    if (password.length < 12 || password.length > 80 || password.trim() !== password || Object.values(passwords).includes(password)) {
+      throw new Error('Set a distinct SETTINGS_PASSWORD value of 12-80 characters.');
     }
     passwords.settings = password;
   }
@@ -127,7 +127,7 @@ export function createPublicAccess(env, settingsAccess) {
       if (!role) return res.status(403).json({ message: '设置账号无权执行此操作' });
     }
     if (role === 'admin') return next();
-    if (role === 'screen' && ['POST /draw', 'POST /logout'].includes(route)) return next();
+    if (role === 'screen' && ['POST /draw', 'POST /logout', 'PUT /screen/qr-layout'].includes(route)) return next();
     res.status(role ? 403 : 401).json({ message: role ? '当前角色无权执行此操作' : '请先登录' });
   }
 

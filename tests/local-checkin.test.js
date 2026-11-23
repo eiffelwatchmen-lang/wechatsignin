@@ -52,6 +52,48 @@ test('local check-in stays on the form even with WeChat configured and a WeChat 
   assert.equal(response.status, 200);
 });
 
+test('only an administrator can pause sign-in; paused submissions are blocked until reopened', async () => {
+  const screenCookie = await login('screen');
+  assert.equal((await json('/api/checkin/status', { checkinEnabled: false }, 'PUT')).status, 401);
+  for (const cookie of [screenCookie, settingsCookie]) {
+    assert.equal((await json('/api/checkin/status', { checkinEnabled: false }, 'PUT', cookie)).status, cookie === settingsCookie ? 401 : 403);
+  }
+  assert.equal((await json('/api/checkin/status', { checkinEnabled: 'false' }, 'PUT', adminCookie)).status, 400);
+  try {
+    assert.equal((await json('/api/checkin/status', { checkinEnabled: false }, 'PUT', adminCookie)).status, 200);
+    const anonymous = await (await fetch(server.url + '/api/state')).json();
+    assert.equal(anonymous.config.checkinEnabled, false);
+    const count = (await state()).attendees.length;
+    const blocked = await checkin({ name: '尚未开始' });
+    assert.equal(blocked.status, 403);
+    assert.match(blocked.body.message, /暂停/);
+    assert.equal((await state()).attendees.length, count);
+    const oauth = await fetch(server.url + '/wechat/oauth/start', { redirect: 'manual' });
+    assert.equal(oauth.headers.get('location'), '/checkin');
+  } finally {
+    await json('/api/checkin/status', { checkinEnabled: true }, 'PUT', adminCookie);
+  }
+  assert.equal((await checkin({ name: '开始后的签到' })).status, 200);
+});
+
+test('screen QR updates persist layout without changing protected settings', async () => {
+  const screenCookie = await login('screen');
+  const before = (await state()).config;
+  assert.equal((await json('/api/screen/qr-layout', { qrSize: 240 }, 'PUT')).status, 401);
+  const updated = await json('/api/screen/qr-layout', {
+    qrSize: 320, qrPosition: { x: 660, y: 40 }, eventTitle: '伪造标题', checkinEnabled: false, adminPassword: 'not-allowed'
+  }, 'PUT', screenCookie);
+  assert.equal(updated.status, 200);
+  assert.equal(updated.body.qrSize, 320);
+  assert.deepEqual(updated.body.qrPosition, { x: 660, y: 40 });
+  const config = (await state()).config;
+  assert.equal(config.eventTitle, before.eventTitle);
+  assert.equal(config.checkinEnabled, before.checkinEnabled);
+  assert.equal((await login('admin')).startsWith('checkin-staff='), true);
+  const bounded = await json('/api/screen/qr-layout', { qrSize: 999, qrPosition: { x: -1, y: 9999 } }, 'PUT', screenCookie);
+  assert.deepEqual(bounded.body, { qrSize: 480, qrPosition: { x: 0, y: 2000 } });
+});
+
 test('local check-in validates the phone and generates an escaped name avatar', async () => {
   const result = await checkin({ phone: '+86 138-0013-8000', name: '  嘉宾 <甲&>  ', source: 'local-form' });
   assert.equal(result.status, 200);

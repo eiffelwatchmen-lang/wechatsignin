@@ -413,7 +413,49 @@ th {
   background: rgba(255, 255, 255, 0.95);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
   text-align: center;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
+
+.qr-card.is-adjusting { cursor: grabbing; }
+.qr-card:focus-visible { outline: 3px solid #f4c762; outline-offset: 4px; }
+.qr-resize-handle {
+  position: absolute;
+  right: -10px;
+  bottom: -10px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 4px;
+  border: 1px solid #e5b84a;
+  border-radius: 4px;
+  color: #7a1b16;
+  background: #ffe6a8;
+  cursor: nwse-resize;
+  opacity: 0;
+  touch-action: none;
+}
+.qr-resize-handle svg { width: 18px; height: 18px; }
+.qr-card:hover .qr-resize-handle,
+.qr-card:focus-within .qr-resize-handle { opacity: 1; }
+@media (pointer: coarse) { .qr-resize-handle { opacity: 1; } }
+
+.checkin-control-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 16px 0;
+  border-block: 1px solid #e6ddd6;
+}
+.checkin-control-bar > div { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+.checkin-control-bar button { display: inline-flex; align-items: center; gap: 8px; }
+.checkin-control-bar button svg { width: 18px; height: 18px; }
 
 .qr-card img {
   width: calc(var(--qr-size, 106px) - 18px);
@@ -3118,7 +3160,7 @@ th {
   }
 
   .screen-page:not(.is-drawing) .qr-card {
-    opacity: 0.88;
+    opacity: 1;
   }
 
   .screen-page.is-drawing .focus-card img {
@@ -3750,7 +3792,7 @@ th {
   }
 
   .checkin-display-title {
-    margin-top: 154px;
+    margin-top: var(--checkin-qr-clearance, 154px);
   }
 
   .recent-checkins {

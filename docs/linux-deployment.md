@@ -79,7 +79,7 @@ fi
 sudoedit /opt/wechatsignin/.env
 ```
 
-把 `PUBLIC_URL` 设为实际的 HTTPS 地址，填写三个不同的 16–80 字符管理密码，以及有 `snsapi_userinfo` 网页授权权限的公众号凭据。管理密码和 AppSecret 只保存在服务器的 `.env` 中。[公网配置模板](../deploy/iis/public.env.example)
+把 `PUBLIC_URL` 设为实际的 HTTPS 地址，填写三个不同的 12 至 80 字符管理密码（建议至少 16 字符随机密码），以及有 `snsapi_userinfo` 网页授权权限的公众号凭据。管理密码和 AppSecret 只保存在服务器的 `.env` 中。[公网配置模板](../deploy/iis/public.env.example)
 
 ```dotenv
 PUBLIC_DEPLOYMENT=1

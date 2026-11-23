@@ -211,7 +211,7 @@ function publicState(req, store = loadStore(), includeSelf = true) {
       screen: store.config.screenPassword === 'screen123'
     } }),
     accessRole: role || null,
-    config: role || settingsAccess.session(req) ? config : { eventTitle: config.eventTitle, subtitle: config.subtitle, checkinMode },
+    config: role || settingsAccess.session(req) ? config : { eventTitle: config.eventTitle, subtitle: config.subtitle, checkinMode, checkinEnabled: config.checkinEnabled },
     attendees: role === 'admin' ? store.attendees : role === 'screen' ? store.attendees.map(screenAttendee) : [],
     prizes: role === 'admin' ? store.prizes : role === 'screen' ? store.prizes.map(screenPrize) : [],
     winners: role === 'admin' ? store.winners : role === 'screen' ? store.winners.map(screenWinner) : [],
@@ -434,6 +434,7 @@ function startVisitor(res) {
 }
 
 app.get('/wechat/oauth/start', (req, res) => {
+  if (loadStore().config.checkinEnabled === false) return res.redirect('/checkin');
   if (!wechatCheckin?.ready || (!publicAccess && loadStore().config.checkinMode !== 'wechat')) {
     return res.redirect('/checkin?wechat=not-ready');
   }
@@ -453,7 +454,7 @@ app.get('/checkin', (req, res, next) => {
   res.set('Cache-Control', 'no-store');
   if (req.method !== 'GET') return next();
   if (publicAccess || loadStore().config.checkinMode === 'wechat') {
-    if (wechatCheckin?.ready && !req.query.wechat && isWechatBrowser(req) && !wechatCheckin.profile(req)) {
+    if (loadStore().config.checkinEnabled !== false && wechatCheckin?.ready && !req.query.wechat && isWechatBrowser(req) && !wechatCheckin.profile(req)) {
       return res.redirect('/wechat/oauth/start');
     }
   } else if (!readToken(req, visitorCookie)) {
@@ -486,6 +487,27 @@ function requireSettingsSession(req, res, next) {
   if (allowLanOrigin(req, res)) next();
 }
 
+app.put('/api/checkin/status', requireAdminSession, (req, res) => {
+  if (typeof req.body?.checkinEnabled !== 'boolean') return res.status(400).json({ message: '请选择签到状态' });
+  const store = loadStore();
+  store.config.checkinEnabled = req.body.checkinEnabled;
+  saveStore(store);
+  emitState('config:update', publicConfig(store.config));
+  res.json({ checkinEnabled: store.config.checkinEnabled });
+});
+
+app.put('/api/screen/qr-layout', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!staffAccess.session(req)) return res.status(401).json({ message: '请先登录大屏' });
+  if (!allowLanOrigin(req, res)) return;
+  const store = loadStore();
+  if ('qrPosition' in (req.body || {})) store.config.qrPosition = safePosition(req.body.qrPosition, store.config.qrPosition);
+  if ('qrSize' in (req.body || {})) store.config.qrSize = safeNumber(req.body.qrSize, store.config.qrSize, 88, 480);
+  saveStore(store);
+  emitState('config:update', publicConfig(store.config));
+  res.json({ qrPosition: store.config.qrPosition, qrSize: store.config.qrSize });
+});
+
 app.put('/api/config', requireSettingsSession, (req, res) => {
   const store = loadStore();
   const body = req.body || {};
@@ -505,7 +527,7 @@ app.put('/api/config', requireSettingsSession, (req, res) => {
   }
   if ('logoPosition' in body) next.logoPosition = safePosition(body.logoPosition, next.logoPosition);
   if ('qrPosition' in body) next.qrPosition = safePosition(body.qrPosition, next.qrPosition);
-  if ('qrSize' in body) next.qrSize = safeNumber(body.qrSize, next.qrSize || 106, 88, 280);
+  if ('qrSize' in body) next.qrSize = safeNumber(body.qrSize, next.qrSize || 106, 88, 480);
   if (!publicAccess) {
     const adminPassword = cleanText(body.adminPassword, 80);
     const screenPassword = cleanText(body.screenPassword, 80);
@@ -574,6 +596,7 @@ app.post('/api/checkin/avatar', (req, res, next) => {
 app.post('/api/checkin', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const store = loadStore();
+  if (store.config.checkinEnabled === false) return res.status(403).json({ message: '签到已暂停，请等待主办方开始签到' });
   const wechatMode = publicAccess || store.config.checkinMode === 'wechat';
   if (!allowLanOrigin(req, res, wechatOrigin)) return;
   const profile = wechatMode ? wechatCheckin?.profile(req) : null;

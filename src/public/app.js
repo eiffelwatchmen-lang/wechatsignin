@@ -15,6 +15,9 @@ let activeAdminTab = 'checkins';
 let selectedLoginRole = 'admin';
 const settingsPath = '/screen/settings';
 const pendingFixedPrizes = new Set();
+let pendingCheckinStatus = false;
+let qrInteraction = null;
+let qrSaving = false;
 const checkinUiState = {
   initialized: false,
   editing: false,
@@ -46,6 +49,10 @@ let drawState = {
 document.addEventListener('DOMContentLoaded', boot);
 window.addEventListener('popstate', render);
 window.addEventListener('resize', () => {
+  if (window.location.pathname === '/screen/checkin' && hasRole('screen') && !qrInteraction && !qrSaving) {
+    renderCheckinScreen();
+    return;
+  }
   if (drawState.rolling && !drawState.stopping) refreshDrawGeometry(drawState.activeAnimation);
   else if (window.location.pathname === '/screen/checkin') paintAvatarStage();
 });
@@ -68,6 +75,7 @@ function connectSocket() {
     const previous = state;
     state = { accessRole: previous.accessRole, hasSettingsAccess: previous.hasSettingsAccess, ...nextState };
     const path = window.location.pathname;
+    if (path === '/screen/checkin' && (qrInteraction || qrSaving)) return;
     if (path === '/screen/checkin' && document.querySelector('.checkin-display-page')
         && previous.accessRole === state.accessRole && previous.checkinUrl === state.checkinUrl
         && JSON.stringify(previous.config) === JSON.stringify(state.config)
@@ -240,6 +248,17 @@ function isWechatCheckin() {
 }
 
 function renderCheckin() {
+  if (state.config.checkinEnabled === false) {
+    app.innerHTML = `<main class="checkin-page local-checkin-page">
+      <section class="checkin-card local-checkin-card success-state">
+        <div class="brand-mark">签</div>
+        <h1 class="mobile-title">签到已暂停</h1>
+        <button type="button" id="refreshCheckinButton">刷新签到状态</button>
+      </section>
+    </main>`;
+    document.querySelector('#refreshCheckinButton')?.addEventListener('click', () => window.location.reload());
+    return;
+  }
   if (isWechatCheckin()) renderWechatCheckin();
   else renderLocalCheckin();
 }
@@ -252,7 +271,7 @@ function renderWechatCheckin() {
   }
   const insideWechat = /MicroMessenger/i.test(navigator.userAgent);
   const outcome = new URLSearchParams(window.location.search).get('wechat');
-  const title = !ready ? '微信签到暂未开放'
+  const title = !ready ? '微信签到暂不可用'
     : !insideWechat ? '请用微信扫码签到'
       : outcome === 'denied' ? '未同意微信授权'
         : outcome ? '微信授权未完成' : '微信授权签到';
@@ -537,11 +556,12 @@ function renderCheckinScreen(arrivals = new Set()) {
   const qrY = clampScreenPosition(config.qrPosition?.y, 28, qrSize + 46, 'y');
   const recent = state.attendees.slice(-6).reverse();
   app.innerHTML = `
-    <main class="screen-page checkin-display-page">
+    <main class="screen-page checkin-display-page" style="--checkin-qr-clearance:${Math.max(90, qrY + qrSize + 46)}px;">
       ${renderScreenBrand()}
-      <div class="qr-card" style="right:auto; left:${qrX}px; top:${qrY}px; --qr-size:${qrSize}px;">
+      <div class="qr-card" tabindex="0" aria-label="移动签到二维码" title="移动签到二维码" style="right:auto; left:${qrX}px; top:${qrY}px; --qr-size:${qrSize}px;">
         <img draggable="false" src="/api/qrcode.svg?target=${encodeURIComponent(state.checkinUrl || `${location.origin}/checkin`)}" alt="签到二维码" />
-        <strong>微信扫码签到</strong>
+        <strong>${config.checkinEnabled === false ? '签到已暂停' : '微信扫码签到'}</strong>
+        <button type="button" class="qr-resize-handle" aria-label="调整二维码大小" title="调整二维码大小">${screenIcon('move-diagonal-2')}</button>
       </div>
       ${config.musicUrl ? `<audio id="screenAudio" src="${escapeHtml(config.musicUrl)}" loop></audio>` : ''}
       <div class="screen-content checkin-display-content">
@@ -671,7 +691,104 @@ function cycleScreenPrize(direction) {
 function clampQrSize(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return 106;
-  return Math.max(88, Math.min(280, Math.round(number)));
+  return Math.max(88, Math.min(480, window.innerWidth - 24, window.innerHeight - 72, Math.round(number)));
+}
+
+function qrLayout(size, x, y) {
+  const qrSize = clampQrSize(size);
+  return {
+    qrSize,
+    qrPosition: {
+      x: Math.round(clampScreenPosition(x, 16, qrSize, 'x')),
+      y: Math.round(clampScreenPosition(y, 28, qrSize + 34, 'y'))
+    }
+  };
+}
+
+function applyQrLayout(card, layout) {
+  card.style.left = `${layout.qrPosition.x}px`;
+  card.style.top = `${layout.qrPosition.y}px`;
+  card.style.setProperty('--qr-size', `${layout.qrSize}px`);
+  card.closest('.checkin-display-page')?.style.setProperty('--checkin-qr-clearance', `${Math.max(90, layout.qrPosition.y + layout.qrSize + 46)}px`);
+}
+
+async function saveQrLayout(layout) {
+  const previous = { qrPosition: state.config.qrPosition, qrSize: state.config.qrSize };
+  state.config = { ...state.config, ...layout };
+  qrSaving = true;
+  try {
+    const saved = await api('/api/screen/qr-layout', { method: 'PUT', body: layout });
+    state.config = { ...state.config, ...saved };
+  } catch (error) {
+    state.config = { ...state.config, ...previous };
+    toast(error.message);
+  } finally {
+    qrSaving = false;
+    if (location.pathname === '/screen/checkin') {
+      const focus = document.activeElement?.closest('.qr-resize-handle') ? '.qr-resize-handle'
+        : document.activeElement?.closest('.qr-card') ? '.qr-card' : null;
+      renderCheckinScreen();
+      if (focus) document.querySelector(focus)?.focus();
+    }
+  }
+}
+
+function bindQrLayout() {
+  const card = document.querySelector('.qr-card');
+  if (!card) return;
+  card.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || qrSaving || qrInteraction) return;
+    const rect = card.getBoundingClientRect();
+    qrInteraction = {
+      pointerId: event.pointerId, x: event.clientX, y: event.clientY,
+      left: rect.left, top: rect.top, size: rect.width,
+      resizing: Boolean(event.target.closest('.qr-resize-handle')),
+      layout: qrLayout(rect.width, rect.left, rect.top), moved: false
+    };
+    card.setPointerCapture(event.pointerId);
+    card.classList.add('is-adjusting');
+    event.preventDefault();
+  });
+  card.addEventListener('pointermove', (event) => {
+    const drag = qrInteraction;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) < 3 && !drag.moved) return;
+    drag.moved = true;
+    drag.layout = drag.resizing
+      ? qrLayout(drag.size + Math.max(dx, dy), drag.left, drag.top)
+      : qrLayout(drag.size, drag.left + dx, drag.top + dy);
+    applyQrLayout(card, drag.layout);
+  });
+  const finish = (event) => {
+    const drag = qrInteraction;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    qrInteraction = null;
+    card.classList.remove('is-adjusting');
+    if (event.type === 'pointerup' && drag.moved) saveQrLayout(drag.layout);
+    else renderCheckinScreen();
+  };
+  card.addEventListener('pointerup', finish);
+  card.addEventListener('pointercancel', finish);
+  card.addEventListener('lostpointercapture', finish);
+  card.addEventListener('keydown', (event) => {
+    if (qrSaving || qrInteraction) return;
+    const rect = card.getBoundingClientRect();
+    const step = event.shiftKey ? 10 : 2;
+    const arrows = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+    const resizing = event.target.closest('.qr-resize-handle');
+    let layout;
+    if (['+', '=', '-'].includes(event.key) || (resizing && arrows[event.key])) {
+      const delta = event.key === '-' || ['ArrowLeft', 'ArrowUp'].includes(event.key) ? -step : step;
+      layout = qrLayout(rect.width + delta, rect.left, rect.top);
+    } else if (arrows[event.key]) {
+      const [dx, dy] = arrows[event.key];
+      layout = qrLayout(rect.width, rect.left + dx, rect.top + dy);
+    } else return;
+    event.preventDefault();
+    saveQrLayout(layout);
+  });
 }
 
 function clampScreenPosition(value, fallback, elementSize, axis) {
@@ -1091,6 +1208,7 @@ function textPositions(count, width, height, text) {
 }
 
 function bindScreenEvents() {
+  bindQrLayout();
   document.querySelectorAll('[data-screen-path]').forEach((link) => {
     link.addEventListener('click', (event) => {
       if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -1525,6 +1643,7 @@ function renderAdmin(arrivals = new Set()) {
   `;
   bindAdminEvents();
   bindLogout();
+  window.lucide?.createIcons();
 }
 
 function adminTabButton(tab, label) {
@@ -1538,6 +1657,8 @@ function renderAdminPanel(arrivals) {
 }
 
 function renderCheckinPanel(arrivals = new Set()) {
+  const enabled = state.config.checkinEnabled !== false;
+  const wechatMissing = isWechatCheckin() && !state.wechat?.ready;
   const rows = state.attendees.slice().reverse().map((attendee, index) => `
     <tr${arrivals.has(attendee.id) ? ' class="checkin-arrival"' : ''} data-checkin-id="${escapeHtml(attendee.id)}">
       <td class="nowrap">${state.attendees.length - index}</td>
@@ -1551,6 +1672,10 @@ function renderCheckinPanel(arrivals = new Set()) {
     </tr>
   `).join('');
   return `
+    <section class="checkin-control-bar" aria-label="签到状态">
+      <div><strong>${enabled ? '签到已开启' : '签到已暂停'}</strong>${wechatMissing ? '<span class="error-text">微信授权未配置</span>' : ''}</div>
+      <button type="button" id="toggleCheckinButton" ${pendingCheckinStatus ? 'disabled' : ''}>${screenIcon(enabled ? 'pause' : 'play')}${enabled ? '暂停签到' : '开始签到'}</button>
+    </section>
     <section class="panel">
       <div class="panel-title">
         <h2>签到人员</h2>
@@ -1787,7 +1912,7 @@ function renderSettingsPanel() {
           <div class="grid-3">
             <label>二维码左边距（px）<input name="qrX" type="number" min="0" max="3000" value="${Number(config.qrPosition?.x ?? 1120)}" required /></label>
             <label>二维码上边距（px）<input name="qrY" type="number" min="0" max="3000" value="${Number(config.qrPosition?.y ?? 28)}" required /></label>
-            <label>二维码大小（px）<input name="qrSize" type="number" min="88" max="280" value="${Number(config.qrSize ?? 106)}" required /></label>
+            <label>二维码大小（px）<input name="qrSize" type="number" min="88" max="480" value="${Number(config.qrSize ?? 106)}" required /></label>
           </div>
         </fieldset>
         <label>单位下拉预设
@@ -1858,6 +1983,20 @@ function renderExportPanel() {
 }
 
 function bindAdminEvents() {
+  document.querySelector('#toggleCheckinButton')?.addEventListener('click', async () => {
+    if (pendingCheckinStatus) return;
+    pendingCheckinStatus = true;
+    document.querySelector('#toggleCheckinButton').disabled = true;
+    try {
+      const saved = await api('/api/checkin/status', { method: 'PUT', body: { checkinEnabled: state.config.checkinEnabled === false } });
+      state.config = { ...state.config, ...saved };
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      pendingCheckinStatus = false;
+      if (location.pathname === '/admin') renderAdmin();
+    }
+  });
   const panel = document.querySelector('#adminPanel');
   panel?.addEventListener('change', (event) => {
     const form = event.target.closest('.fixed-winner-add');

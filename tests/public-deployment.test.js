@@ -79,6 +79,31 @@ test('public startup requires HTTPS and distinct non-default passwords', () => {
   assert.throws(() => createPublicAccess({ PUBLIC_DEPLOYMENT: '1', PUBLIC_URL: origin, ADMIN_PASSWORD: 'admin123' }), /password|PASSWORD/);
   assert.throws(() => createPublicAccess({ ...credentials, SETTINGS_PASSWORD: adminPassword }), /SETTINGS_PASSWORD/);
   assert.equal(createPublicAccess({ ...credentials, SETTINGS_PASSWORD: '' }).settingsReady, false);
+  assert.throws(() => createPublicAccess({ ...credentials, ADMIN_PASSWORD: 'a'.repeat(11) }), /PASSWORD/);
+  assert.throws(() => createPublicAccess({ ...credentials, SETTINGS_PASSWORD: 'b'.repeat(11) }), /SETTINGS_PASSWORD/);
+  const shortCredentials = createPublicAccess({ ...credentials, ADMIN_PASSWORD: 'alpha12345ht', SCREEN_PASSWORD: 'alpha12345dp', SETTINGS_PASSWORD: 'alpha12345pz' });
+  assert.equal(shortCredentials.matchesPassword('admin', 'alpha12345ht'), true);
+});
+
+test('public sign-in control and screen QR layout have distinct permissions', async () => {
+  const login = async (role, password) => cookieFrom(await request('/api/login', { method: 'POST', body: { role, password } }), 'staff');
+  const admin = await login('admin', adminPassword);
+  const screen = await login('screen', screenPassword);
+  assert.equal((await request('/api/checkin/status', { method: 'PUT', cookie: screen, body: { checkinEnabled: false } })).status, 403);
+  try {
+    assert.equal((await request('/api/checkin/status', { method: 'PUT', cookie: admin, body: { checkinEnabled: false } })).status, 200);
+    assert.equal((await (await request('/api/state')).json()).config.checkinEnabled, false);
+    assert.equal((await request('/checkin', { wechat: true })).status, 200);
+    assert.equal((await request('/wechat/oauth/start', { wechat: true })).headers.get('location'), '/checkin');
+    assert.equal((await request('/api/checkin', { method: 'POST', body: { name: '暂停时签到', phone: '13800138000' } })).status, 403);
+  } finally {
+    await request('/api/checkin/status', { method: 'PUT', cookie: admin, body: { checkinEnabled: true } });
+  }
+  const saved = await request('/api/screen/qr-layout', { method: 'PUT', cookie: screen, body: { qrSize: 350, eventTitle: '不允许修改' } });
+  assert.equal(saved.status, 200);
+  assert.equal((await saved.json()).qrSize, 350);
+  assert.equal((await request('/api/screen/qr-layout', { method: 'PUT', cookie: screen, from: 'https://other.example.test', body: { qrSize: 120 } })).status, 403);
+  assert.equal((await request('/api/config', { method: 'PUT', cookie: screen, body: { qrSize: 120 } })).status, 403);
 });
 
 test('anonymous access exposes only activity information and cannot manage the event', async () => {

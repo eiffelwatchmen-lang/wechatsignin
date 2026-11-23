@@ -61,7 +61,8 @@ test('check-in and lottery have independent display routes', () => {
   assert.match(checkin.app.innerHTML, /签到头像墙/);
   assert.match(checkin.app.innerHTML, /签到二维码/);
   assert.doesNotMatch(checkin.app.innerHTML, /id="drawButton"|id="prizeResults"/);
-  assert.doesNotMatch(checkin.app.innerHTML, /shapeButton|backAdminButton|data-drag-key|qr-resize-handle|\/screen\/settings/);
+  assert.match(checkin.app.innerHTML, /qr-resize-handle/);
+  assert.doesNotMatch(checkin.app.innerHTML, /shapeButton|backAdminButton|data-drag-key|\/screen\/settings/);
 
   for (const route of ['/screen/lottery', '/screen']) {
     const lottery = browser(route);
@@ -71,6 +72,50 @@ test('check-in and lottery have independent display routes', () => {
     assert.doesNotMatch(lottery.app.innerHTML, /签到二维码|最近签到/);
     assert.doesNotMatch(lottery.app.innerHTML, /backAdminButton|data-drag-key|\/screen\/settings/);
   }
+});
+
+test('the admin can distinguish paused check-in from missing WeChat configuration', () => {
+  const ui = browser('/admin');
+  ui.run(`state.accessRole = 'admin'; state.config.checkinEnabled = false;`);
+  ui.context.render();
+  assert.match(ui.app.innerHTML, /签到已暂停/);
+  assert.match(ui.app.innerHTML, /开始签到/);
+  ui.run(`state.config.checkinEnabled = true; state.deployment = 'public'; state.wechat = { ready: false };`);
+  ui.context.render();
+  assert.match(ui.app.innerHTML, /暂停签到/);
+  assert.match(ui.app.innerHTML, /微信授权未配置/);
+});
+
+test('QR layouts fit the current viewport and clamp oversized or negative input', () => {
+  const ui = browser('/screen/checkin');
+  assert.equal(ui.context.qrLayout(900, -200, -200).qrSize, 480);
+  assert.equal(ui.context.qrLayout(900, -200, -200).qrPosition.x, 0);
+  ui.run(`window.innerWidth = 390; window.innerHeight = 844;`);
+  const layout = ui.context.qrLayout(480, 4000, 4000);
+  assert.ok(layout.qrPosition.x + layout.qrSize <= 390);
+  assert.ok(layout.qrPosition.y + layout.qrSize + 34 <= 844);
+});
+
+test('QR saves use the limited layout endpoint and restore the layout after a failed save', async () => {
+  const ui = browser('/screen/checkin');
+  ui.context.location = { pathname: '/screen/checkin' };
+  ui.run(`
+    state.config = { qrSize: 106, qrPosition: { x: 50, y: 28 }, eventTitle: '保留标题' };
+    toast = () => {};
+    renderCheckinScreen = () => {};
+    api = async (path, options) => {
+      if (path !== '/api/screen/qr-layout' || options.method !== 'PUT') throw new Error('wrong endpoint');
+      return options.body;
+    };
+  `);
+  await ui.context.saveQrLayout({ qrSize: 230, qrPosition: { x: 860, y: 40 } });
+  assert.equal(ui.run('state.config.qrSize'), 230);
+  ui.run(`api = async () => { throw new Error('Network unavailable'); };`);
+  await ui.context.saveQrLayout({ qrSize: 320, qrPosition: { x: 1200, y: 400 } });
+  assert.equal(ui.run('state.config.qrSize'), 230);
+  assert.equal(ui.run('state.config.qrPosition.x'), 860);
+  assert.equal(ui.run('state.config.eventTitle'), '保留标题');
+  assert.equal(ui.run('qrSaving'), false);
 });
 
 test('the separate settings route requires its own session', () => {

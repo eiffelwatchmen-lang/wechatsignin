@@ -5,7 +5,7 @@
 ## 1. 启动 Node 服务
 
 1. 在 Windows 安装 [Node.js 24 LTS](https://nodejs.org/en/download)。将更新后的项目解压到 `C:\Apps\WechatSignIn`，放在 IIS 站点目录之外。
-2. 新部署时将 [public.env.example](../deploy/iis/public.env.example) 作为项目根目录的 `.env`。已有 `.env` 时合并配置，保留备份。后台、大屏和大屏设置各用不同的 16 至 80 字符随机密码。已有部署可先升级服务，再填入 `SETTINGS_PASSWORD` 并重启以启用设置页。
+2. 新部署时将 [public.env.example](../deploy/iis/public.env.example) 作为项目根目录的 `.env`。已有 `.env` 时合并配置，保留备份。后台、大屏和大屏设置各用不同的 12 至 80 字符密码，建议使用至少 16 字符随机密码。已有部署可先升级服务，再填入 `SETTINGS_PASSWORD` 并重启以启用设置页。
 
 ```dotenv
 PUBLIC_DEPLOYMENT=1
@@ -57,4 +57,4 @@ npm.cmd start
 - 验收完成后用 Windows 任务计划程序设为系统启动时运行：程序为 `node.exe` 的完整路径，参数为 `src\server.js`，起始目录为 `C:\Apps\WechatSignIn`。使用专用低权限账户，授予项目读取权限，以及 `data` 和 `assets\uploads` 的写入权限。配置任务失败后重启；先关闭手动启动的实例，再启动计划任务。
 - 更新前停止服务，备份 `.env`、`data\store.json` 和 `assets\uploads`。公网密码通过 `.env` 更换，重启后工作人员需重新登录，来宾需重新授权。旧版内网记录可迁移，但不会与微信身份自动合并。
 
-**排查：** `404` 先看站点绑定和重写规则；`502` 先检查 Node 是否监听 3100；授权失败先核对域名、公众号权限和 AppID 是否匹配；不实时更新时检查 `/socket.io/` 转发、WebSocket 和代理缓存。
+**排查：** 后台「签到管理」点击「开始签到」可开放签到。「微信授权未配置」或 `/api/state` 返回 `wechat.ready=false` 时，需要在服务器 `.env` 填入 `WECHAT_APP_ID` 和 `WECHAT_APP_SECRET` 后重启 Node，不是签到开关的问题。`404` 先看站点绑定和重写规则；`502` 先检查 Node 是否监听 3100；授权失败先核对域名、公众号权限和 AppID 是否匹配；不实时更新时检查 `/socket.io/` 转发、WebSocket 和代理缓存。

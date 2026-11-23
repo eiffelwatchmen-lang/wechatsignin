@@ -8,6 +8,7 @@
     "musicUrl": "",
     "theme": "celebration",
     "checkinMode": "local",
+    "checkinEnabled": true,
     "wallMode": "sphere",
     "wallText": "LUCKY",
     "allowRepeatWinners": false,
