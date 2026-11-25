@@ -1547,17 +1547,6 @@ th {
   font-size: 15px;
 }
 
-.winner-fixed {
-  display: inline-flex;
-  margin-top: 12px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  color: #6e1c09;
-  background: #ffe49b;
-  font-size: 12px;
-  font-weight: 800;
-}
-
 .winner-modal-actions {
   position: relative;
   z-index: 1;
@@ -1863,26 +1852,7 @@ th {
   object-fit: cover;
 }
 
-.settings-page {
-  max-width: 980px;
-  margin: 0 auto;
-  padding: 24px 16px;
-}
-
-.settings-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 18px;
-}
-
-.settings-header h1 {
-  margin: 0;
-  color: #7f1d1d;
-  font-size: 24px;
-}
+.settings-unlock-form { max-width: 440px; }
 
 .settings-layout,
 .fixed-winner-editor {
@@ -2002,6 +1972,9 @@ th {
   gap: 16px;
 }
 
+.local-checkin-card .checkin-form > label,
+.local-checkin-card #checkinCompany { min-width: 0; }
+
 .local-checkin-card input[name="name"] {
   min-height: 48px;
   font-size: 16px;
@@ -2110,7 +2083,8 @@ th {
   line-height: 1.4;
 }
 
-.local-checkin-card .checkin-success-name {
+.local-checkin-card .checkin-success-name,
+.local-checkin-card .checkin-success-company {
   max-width: 100%;
   overflow-wrap: anywhere;
 }
@@ -2501,6 +2475,18 @@ th {
   .checkin-card {
     padding: 18px;
   }
+
+  .admin-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .admin-header p { overflow-wrap: anywhere; }
+  .admin-header .stat-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .admin-header .stat { min-width: 0; }
 
   .grid-2,
   .grid-3,

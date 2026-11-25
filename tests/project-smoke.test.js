@@ -8,6 +8,7 @@ const root = path.resolve(import.meta.dirname, '..');
 test('initial store has required sections', () => {
   const store = JSON.parse(fs.readFileSync(path.join(root, 'data', 'store.example.json'), 'utf8'));
   assert.ok(store.config.eventTitle);
+  assert.equal(store.config.wallMode, 'orbit');
   assert.ok(Array.isArray(store.attendees));
   assert.ok(Array.isArray(store.prizes));
   assert.ok(Array.isArray(store.winners));

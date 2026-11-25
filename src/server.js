@@ -88,6 +88,10 @@ if (publicAccess) {
 app.use(express.json({ limit: '8mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(UPLOAD_DIR));
+app.get('/screen/settings', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.redirect('/admin?tab=settings');
+});
 app.get('/vendor/lucide.js', (req, res) => {
   res.sendFile(path.join(ROOT_DIR, 'node_modules', 'lucide', 'dist', 'umd', 'lucide.min.js'));
 });
@@ -156,7 +160,7 @@ function normalizeStore(store) {
   const attendeeIds = new Set(attendees.map((attendee) => attendee.id));
   const prizes = Array.isArray(store.prizes) ? store.prizes : defaults.prizes;
   return {
-    config: { ...defaults.config, ...(store.config || {}) },
+    config: { ...defaults.config, ...(store.config || {}), companies: normalizeCompanies(store.config?.companies ?? defaults.config.companies) },
     attendees,
     prizes: prizes.map((prize) => ({
       ...prize,
@@ -169,6 +173,12 @@ function normalizeStore(store) {
 
 function cleanText(value, max = 120) {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function normalizeCompanies(value) {
+  return Array.isArray(value)
+    ? [...new Set(value.filter((item) => typeof item === 'string').map((item) => cleanText(item, 40)).filter(Boolean))].slice(0, 80)
+    : [];
 }
 
 function cleanPhone(value) {
@@ -211,7 +221,7 @@ function publicState(req, store = loadStore(), includeSelf = true) {
       screen: store.config.screenPassword === 'screen123'
     } }),
     accessRole: role || null,
-    config: role || settingsAccess.session(req) ? config : { eventTitle: config.eventTitle, subtitle: config.subtitle, checkinMode, checkinEnabled: config.checkinEnabled },
+    config: role || settingsAccess.session(req) ? config : { eventTitle: config.eventTitle, subtitle: config.subtitle, checkinMode, checkinEnabled: config.checkinEnabled, companies: config.companies },
     attendees: role === 'admin' ? store.attendees : role === 'screen' ? store.attendees.map(screenAttendee) : [],
     prizes: role === 'admin' ? store.prizes : role === 'screen' ? store.prizes.map(screenPrize) : [],
     winners: role === 'admin' ? store.winners : role === 'screen' ? store.winners.map(screenWinner) : [],
@@ -392,7 +402,7 @@ app.post('/api/login', (req, res) => {
     if (!valid) return res.status(401).json({ message: '设置密码不正确' });
     settingsAccess.endSession(req);
     settingsAccess.startSession(res, 'settings');
-    return res.json({ ok: true, role: 'settings', path: '/screen/settings' });
+    return res.json({ ok: true, role: 'settings', path: '/admin?tab=settings' });
   }
   const role = requestedRole === 'screen' ? 'screen' : 'admin';
   const valid = publicAccess ? publicAccess.matchesPassword(role, password)
@@ -523,7 +533,7 @@ app.put('/api/config', requireSettingsSession, (req, res) => {
   if ('wallText' in body) next.wallText = cleanText(body.wallText, 16) || 'LUCKY';
   if ('allowRepeatWinners' in body) next.allowRepeatWinners = Boolean(body.allowRepeatWinners);
   if ('companies' in body && Array.isArray(body.companies)) {
-    next.companies = body.companies.map((item) => cleanText(item, 40)).filter(Boolean).slice(0, 80);
+    next.companies = normalizeCompanies(body.companies);
   }
   if ('logoPosition' in body) next.logoPosition = safePosition(body.logoPosition, next.logoPosition);
   if ('qrPosition' in body) next.qrPosition = safePosition(body.qrPosition, next.qrPosition);
@@ -617,6 +627,10 @@ app.post('/api/checkin', (req, res) => {
   const visitor = profile ? '' : readToken(req, visitorCookie) || startVisitor(res);
   const openid = profile?.id || localVisitorId(visitor);
   const existing = findCheckinAttendee(store, profile, visitor);
+  const company = body.company === undefined ? existing?.company || '' : typeof body.company === 'string' ? cleanText(body.company, 80) : null;
+  if (company === null || (company && !store.config.companies.includes(company) && company !== existing?.company)) {
+    return res.status(400).json({ code: 'COMPANY_OPTIONS_CHANGED', message: '单位列表已更新，请重新选择所属单位' });
+  }
   const source = profile ? 'wechat-oauth' : 'local-form';
   let avatar = profile ? profile.avatar : cleanText(body.avatar, 5000);
   if (source === 'local-form' && avatar) {
@@ -633,7 +647,7 @@ app.post('/api/checkin', (req, res) => {
     nickname: (profile ? cleanText(profile.nickname, 60) : cleanText(body.nickname, 60)) || name,
     avatar,
     name,
-    company: profile || body.company === undefined ? existing?.company || '' : cleanText(body.company, 80),
+    company,
     phone,
     source,
     checkedInAt: now
@@ -665,10 +679,12 @@ app.delete('/api/attendees/:id', (req, res) => {
   res.json({ ok: true, removed: before - store.attendees.length });
 });
 
-app.post('/api/demo/seed', (req, res) => {
+app.post('/api/demo/seed', requireAdminSession, (req, res) => {
   const store = loadStore();
   const existing = new Set(store.attendees.map((item) => item.openid));
-  const additions = demoAttendees().filter((item) => !existing.has(item.openid));
+  const demos = demoAttendees();
+  const count = safeNumber(req.body?.count, demos.length, 1, demos.length);
+  const additions = demos.slice(0, count).filter((item) => !existing.has(item.openid));
   store.attendees.push(...additions);
   saveStore(store);
   emitState('demo:seed', { count: additions.length });
@@ -815,7 +831,7 @@ app.delete('/api/winners/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/reset', (req, res) => {
+app.post('/api/reset', requireAdminSession, (req, res) => {
   const scope = req.body.scope;
   if (scope === 'all' && (!settingsAccess.session(req) || staffAccess.session(req)?.role !== 'admin')) {
     return res.status(403).json({ message: '恢复全部设置需要同时登录后台和大屏设置' });

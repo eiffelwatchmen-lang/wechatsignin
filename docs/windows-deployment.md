@@ -52,7 +52,7 @@ npm.cmd start
 
 - 手机关闭 Wi-Fi，用微信扫描签到大屏二维码。授权后应出现微信头像、姓名和手机号输入框。填齐两项后签到应实时上墙，同一个微信账号再次扫码会识别已有记录。后台可查询和导出手机号，大屏名单隐藏手机号。
 - 打开 [后台](https://qd.kaigao.com/admin)、[签到大屏](https://qd.kaigao.com/screen/checkin)与[抽奖大屏](https://qd.kaigao.com/screen/lottery)。登录后确认新签到头像旋转入场、抽奖正常。后台可以导出 Excel。
-- 用 `SETTINGS_PASSWORD` 登录 [大屏设置](https://qd.kaigao.com/screen/settings)，保存头像墙、Logo 或二维码布局后确认大屏已同步。大屏密码用于操作抽奖，后台密码用于管理奖项和数据。未登录访问 `/api/attendees` 应返回 `401`。
+- 登录后台后点击「大屏设置」，用 `SETTINGS_PASSWORD` 解锁该标签页，保存头像墙、Logo 或二维码布局后确认大屏已同步。原 `/screen/settings` 会转到后台的设置标签页。大屏密码用于操作抽奖，后台密码用于管理奖项和数据。未登录访问 `/api/attendees` 应返回 `401`。
 - 在后台「抽奖设置」中确认新签到只进入待选名单。选人并点击「添加内定」后，才会出现在对应奖项的内定名单中。点击「删除」可取消当前奖项的内定资格，签到记录会保留。
 - 验收完成后用 Windows 任务计划程序设为系统启动时运行：程序为 `node.exe` 的完整路径，参数为 `src\server.js`，起始目录为 `C:\Apps\WechatSignIn`。使用专用低权限账户，授予项目读取权限，以及 `data` 和 `assets\uploads` 的写入权限。配置任务失败后重启；先关闭手动启动的实例，再启动计划任务。
 - 更新前停止服务，备份 `.env`、`data\store.json` 和 `assets\uploads`。公网密码通过 `.env` 更换，重启后工作人员需重新登录，来宾需重新授权。旧版内网记录可迁移，但不会与微信身份自动合并。

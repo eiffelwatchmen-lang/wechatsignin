@@ -13,7 +13,6 @@ let socket;
 let spatialRotationFrame = 0;
 let activeAdminTab = 'checkins';
 let selectedLoginRole = 'admin';
-const settingsPath = '/screen/settings';
 const pendingFixedPrizes = new Set();
 let pendingCheckinStatus = false;
 let qrInteraction = null;
@@ -23,6 +22,7 @@ const checkinUiState = {
   editing: false,
   name: '',
   phone: '',
+  company: '',
   avatar: '',
   preview: '',
   file: null,
@@ -58,6 +58,7 @@ window.addEventListener('resize', () => {
 });
 
 async function boot() {
+  if (new URLSearchParams(window.location.search).get('tab') === 'settings') activeAdminTab = 'settings';
   await refreshState();
   connectSocket();
   render();
@@ -69,7 +70,7 @@ async function refreshState() {
 }
 
 function connectSocket() {
-  if (!state.accessRole || [settingsPath, '/checkin'].includes(window.location.pathname)) return;
+  if (!state.accessRole || window.location.pathname === '/checkin') return;
   socket = io();
   socket.on('state', (nextState) => {
     const previous = state;
@@ -81,6 +82,11 @@ function connectSocket() {
         && JSON.stringify(previous.config) === JSON.stringify(state.config)
         && JSON.stringify(previous.attendees) === JSON.stringify(state.attendees)) return;
     if (path === '/admin' && activeAdminTab === 'prizes' && syncPrizeEditors(previous)) return;
+    if (path === '/admin' && activeAdminTab === 'settings' && document.querySelector('#adminPanel')
+        && previous.accessRole === state.accessRole && previous.hasSettingsAccess === state.hasSettingsAccess) {
+      updateAdminStats();
+      return;
+    }
     const known = new Set(previous.attendees.map((attendee) => attendee.id));
     const arrivals = new Set(state.attendees.filter((attendee) => !known.has(attendee.id)).map((attendee) => attendee.id));
     if (!drawState.rolling) render({ arrivals });
@@ -109,11 +115,6 @@ function render({ arrivals = new Set() } = {}) {
     }
     if (path === '/screen/checkin') renderCheckinScreen(arrivals);
     else renderScreen();
-    return;
-  }
-  if (path === settingsPath) {
-    if (state.hasSettingsAccess) renderSettingsPage();
-    else renderLogin('settings');
     return;
   }
   if (path === '/admin') {
@@ -168,6 +169,7 @@ async function api(path, options = {}) {
     const message = typeof payload === 'object' ? payload.message : payload;
     const error = new Error(message || '请求失败');
     error.status = response.status;
+    error.code = payload && typeof payload === 'object' ? payload.code : undefined;
     throw error;
   }
   return payload;
@@ -191,10 +193,9 @@ function bindLogout(role) {
 }
 
 function renderLogin(forceRole = selectedLoginRole) {
-  const isSettings = window.location.pathname === settingsPath;
-  selectedLoginRole = isSettings ? 'settings' : forceRole;
+  selectedLoginRole = forceRole;
   const defaultPassword = selectedLoginRole === 'admin' ? 'admin123' : 'screen123';
-  const passwordValue = !isSettings && state.loginDefaults?.[selectedLoginRole] ? defaultPassword : '';
+  const passwordValue = state.loginDefaults?.[selectedLoginRole] ? defaultPassword : '';
   app.innerHTML = `
     <main class="login-page">
       <section class="login-card">
@@ -207,15 +208,15 @@ function renderLogin(forceRole = selectedLoginRole) {
           ${state.deployment === 'public' ? '' : '<p>内网运行 / 大屏互动 / 后台导出</p>'}
         </div>
         <form class="login-form" id="loginForm">
-          ${isSettings ? '<h2>大屏设置</h2>' : `<div class="role-switch">
+          <div class="role-switch">
             <button type="button" data-role="admin" class="${selectedLoginRole === 'admin' ? 'active' : ''}">后台</button>
             <button type="button" data-role="screen" class="${selectedLoginRole === 'screen' ? 'active' : ''}">大屏</button>
-          </div>`}
+          </div>
           <label>
-            ${isSettings ? '大屏设置密码' : '访问密码'}
+            访问密码
             <input id="loginPassword" type="password" autocomplete="current-password" value="${passwordValue}" placeholder="请输入访问密码" />
           </label>
-          <button type="submit">进入${isSettings ? '大屏设置' : selectedLoginRole === 'admin' ? '后台' : '大屏'}</button>
+          <button type="submit">进入${selectedLoginRole === 'admin' ? '后台' : '大屏'}</button>
           <div class="error-text" id="loginError"></div>
         </form>
       </section>
@@ -235,7 +236,7 @@ function renderLogin(forceRole = selectedLoginRole) {
       });
       const screenPath = ['/screen', '/screen/checkin', '/screen/lottery'].includes(location.pathname)
         ? location.pathname : '/screen/checkin';
-      const path = isSettings ? settingsPath : result.role === 'screen' ? screenPath : result.path;
+      const path = result.role === 'screen' ? screenPath : activeAdminTab === 'settings' ? '/admin?tab=settings' : result.path;
       window.location.assign(path);
     } catch (err) {
       error.textContent = err.message;
@@ -297,10 +298,13 @@ function renderCheckinForm(attendee, wechatProfile) {
   if (!checkinUiState.initialized) {
     checkinUiState.name = attendee?.name || '';
     checkinUiState.phone = attendee?.phone || '';
+    checkinUiState.company = attendee?.company || '';
     checkinUiState.avatar = wechatProfile ? wechatProfile.avatar : attendee?.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
     checkinUiState.initialized = true;
   }
   const preview = checkinUiState.preview || checkinUiState.avatar || makeAvatarDataUrl(checkinUiState.name);
+  const companies = Array.isArray(state.config.companies) ? state.config.companies : [];
+  const previousCompany = attendee?.company && !companies.includes(attendee.company) ? attendee.company : '';
   app.innerHTML = `
     <main class="checkin-page local-checkin-page">
       <section class="checkin-card local-checkin-card">
@@ -325,6 +329,12 @@ function renderCheckinForm(attendee, wechatProfile) {
           <label for="checkinPhone">手机号
             <input id="checkinPhone" name="phone" type="tel" inputmode="tel" autocomplete="tel" maxlength="32" required value="${escapeHtml(checkinUiState.phone)}" placeholder="请输入手机号" />
           </label>
+          ${companies.length ? `<label for="checkinCompany">所属单位
+            <select id="checkinCompany" name="company" autocomplete="organization">
+              <option value="" ${checkinUiState.company ? '' : 'selected'}>请选择所属单位</option>
+              ${[...companies, ...(previousCompany ? [previousCompany] : [])].map((company) => `<option value="${escapeHtml(company)}" ${company === checkinUiState.company ? 'selected' : ''}>${escapeHtml(company)}</option>`).join('')}
+            </select>
+          </label>` : ''}
           <div id="checkinError" class="error-text" role="alert" aria-live="polite"></div>
           ${wechatProfile ? '<a id="retryWechatCheckin" class="checkin-text-button" href="/wechat/oauth/start" hidden>重新授权</a>' : ''}
           <button id="submitCheckin" type="submit">${screenIcon('check')}<span>${attendee ? '保存资料' : '确认签到'}</span></button>
@@ -348,7 +358,7 @@ function updateCheckinBusy() {
     const element = document.querySelector(selector);
     if (element) element.disabled = busy;
   }
-  for (const selector of ['#checkinName', '#checkinPhone']) {
+  for (const selector of ['#checkinName', '#checkinPhone', '#checkinCompany']) {
     const element = document.querySelector(selector);
     if (element) element.disabled = checkinUiState.submitting;
   }
@@ -402,6 +412,10 @@ function bindLocalCheckinForm() {
     checkinUiState.phone = event.target.value;
     document.querySelector('#checkinError').textContent = '';
   });
+  document.querySelector('#checkinCompany')?.addEventListener('change', (event) => {
+    checkinUiState.company = event.target.value;
+    document.querySelector('#checkinError').textContent = '';
+  });
   document.querySelector('#useNameAvatar')?.addEventListener('click', () => {
     clearCheckinPreview();
     checkinUiState.avatar = '';
@@ -440,6 +454,7 @@ async function submitLocalCheckin(event) {
   if (checkinUiState.submitting || checkinUiState.preparing) return;
   const name = (document.querySelector('#checkinName')?.value ?? checkinUiState.name).replace(/\s+/g, ' ').trim();
   const phone = (document.querySelector('#checkinPhone')?.value ?? checkinUiState.phone).trim();
+  const company = document.querySelector('#checkinCompany')?.value ?? checkinUiState.company;
   const error = document.querySelector('#checkinError');
   error.textContent = '';
   if (!name) {
@@ -452,6 +467,7 @@ async function submitLocalCheckin(event) {
     document.querySelector('#checkinPhone').focus();
     return;
   }
+  Object.assign(checkinUiState, { name, phone, company, initialized: true });
   checkinUiState.submitting = true;
   updateCheckinBusy();
   const wechat = isWechatCheckin();
@@ -465,14 +481,22 @@ async function submitLocalCheckin(event) {
     }
     const result = await api('/api/checkin', {
       method: 'POST',
-      body: wechat ? { name, phone } : { name, phone, avatar: checkinUiState.avatar }
+      body: wechat ? { name, phone, company } : { name, phone, company, avatar: checkinUiState.avatar }
     });
     state.selfAttendee = result.attendee;
     checkinUiState.editing = false;
     clearCheckinPreview();
     renderCheckin();
   } catch (err) {
-    error.textContent = err.message;
+    if (err.code === 'COMPANY_OPTIONS_CHANGED') {
+      try {
+        await refreshState();
+        checkinUiState.company = state.selfAttendee?.company || '';
+        renderCheckin();
+      } catch { /* Keep the current draft available when refreshing fails. */ }
+    }
+    const currentError = document.querySelector('#checkinError');
+    if (currentError) currentError.textContent = err.message;
     const retry = document.querySelector('#retryWechatCheckin');
     if (retry && err.status === 401) retry.hidden = false;
   } finally {
@@ -488,6 +512,7 @@ function renderCheckinSuccess(attendee, local = false) {
         <img class="rolling-avatar" src="${escapeHtml(attendee.avatar || makeAvatarDataUrl(attendee.name))}" alt="" />
         <h1 class="mobile-title">签到成功</h1>
         <p class="mobile-copy checkin-success-name">${escapeHtml(attendee.name)}，祝你好运</p>
+        ${attendee.company ? `<p class="mobile-copy checkin-success-company">所属单位：${escapeHtml(attendee.company)}</p>` : ''}
         ${local ? '<button id="editCheckin" class="checkin-text-button" type="button">修改资料</button>' : ''}
       </section>
     </main>
@@ -498,6 +523,7 @@ function renderCheckinSuccess(attendee, local = false) {
       checkinUiState.editing = true;
       checkinUiState.name = attendee.name;
       checkinUiState.phone = attendee.phone || '';
+      checkinUiState.company = attendee.company || '';
       checkinUiState.avatar = isWechatCheckin() ? state.wechat.profile.avatar
         : attendee.avatar?.startsWith('/uploads/') ? attendee.avatar : '';
       renderCheckin();
@@ -527,10 +553,11 @@ function screenIcon(name) {
 
 function renderScreenBrand() {
   const config = state.config || {};
+  if (!config.logoUrl) return '';
   const x = clampScreenPosition(config.logoPosition?.x, 32, 190, 'x');
   const y = clampScreenPosition(config.logoPosition?.y, 24, 82, 'y');
   return `<div class="screen-logo" style="left:${x}px; top:${y}px;">
-    ${config.logoUrl ? `<img src="${escapeHtml(config.logoUrl)}" alt="活动 Logo" />` : '<div class="brand-mark">签</div><strong>活动现场</strong>'}
+    <img src="${escapeHtml(config.logoUrl)}" alt="活动 Logo" />
   </div>`;
 }
 
@@ -571,7 +598,7 @@ function renderCheckinScreen(arrivals = new Set()) {
           <div class="checkin-total" aria-live="polite">已签到 <strong>${state.attendees.length}</strong> 位</div>
         </header>
         <section class="checkin-display-wall" aria-label="签到头像墙">
-          <div id="avatarStage" class="avatar-stage ${escapeHtml(config.wallMode || 'sphere')}"></div>
+          <div id="avatarStage" class="avatar-stage ${escapeHtml(config.wallMode || 'orbit')}"></div>
         </section>
         <section class="recent-checkins" aria-label="最近签到">
           <h2>最近签到</h2>
@@ -821,8 +848,8 @@ function paintAvatarStage(attendeePool = state.attendees) {
   stopSpatialRotation();
   const stage = document.querySelector('#avatarStage');
   if (!stage) return;
-  const wallMode = state.config.wallMode || 'sphere';
-  const visualMode = drawState.rolling ? drawState.activeAnimation : getVisualWallMode(wallMode, attendeePool.length);
+  const wallMode = state.config.wallMode || 'orbit';
+  const visualMode = drawState.rolling ? drawState.activeAnimation : getVisualWallMode(wallMode);
   stage.classList.remove('sphere', 'wall', 'text', 'orbit');
   stage.classList.add(visualMode);
   const width = Math.max(stage.clientWidth, 1);
@@ -958,9 +985,8 @@ function stopSpatialRotation() {
   spatialRotationFrame = 0;
 }
 
-function getVisualWallMode(mode, count) {
-  if (mode === 'text' && count >= 36) return 'orbit';
-  return ['orbit', 'sphere', 'wall', 'text'].includes(mode) ? mode : 'sphere';
+function getVisualWallMode(mode) {
+  return ['orbit', 'sphere', 'wall', 'text'].includes(mode) ? mode : 'orbit';
 }
 
 function getSphereAvatarPosition(index, count, width, height) {
@@ -1527,7 +1553,6 @@ function showWinnerModal(prize, winners) {
             </div>
             <h3>${escapeHtml(winner.name)}</h3>
             <p>${escapeHtml(winner.company || winner.nickname || '')}</p>
-            ${winner.fixed ? '<span class="winner-fixed">内定</span>' : ''}
           </div>
         `).join('')}
       </div>
@@ -1618,7 +1643,7 @@ function renderAdmin(arrivals = new Set()) {
         <nav class="admin-nav">
           ${adminTabButton('checkins', '签到管理')}
           ${adminTabButton('prizes', '抽奖设置')}
-          <a class="button-link" href="${settingsPath}">大屏设置</a>
+          ${adminTabButton('settings', '大屏设置')}
           ${adminTabButton('exports', '数据导出')}
           <a class="button-link" href="/screen/checkin">签到展示</a>
           <a class="button-link" href="/screen/lottery">抽奖大屏</a>
@@ -1633,8 +1658,8 @@ function renderAdmin(arrivals = new Set()) {
           </div>
           <div class="stat-row">
             <div class="stat"><span>已签到</span><strong id="adminCheckinCount">${checkinCount}</strong></div>
-            <div class="stat"><span>奖项</span><strong>${prizeCount}</strong></div>
-            <div class="stat"><span>已中奖</span><strong>${winnerCount}</strong></div>
+            <div class="stat"><span>奖项</span><strong id="adminPrizeCount">${prizeCount}</strong></div>
+            <div class="stat"><span>已中奖</span><strong id="adminWinnerCount">${winnerCount}</strong></div>
           </div>
         </header>
         <div id="adminPanel">${renderAdminPanel(arrivals)}</div>
@@ -1650,8 +1675,16 @@ function adminTabButton(tab, label) {
   return `<button type="button" data-tab="${tab}" class="${activeAdminTab === tab ? 'active' : ''}">${label}</button>`;
 }
 
+function updateAdminStats() {
+  for (const [selector, count] of [['#adminCheckinCount', state.attendees.length], ['#adminPrizeCount', state.prizes.length], ['#adminWinnerCount', state.winners.length]]) {
+    const node = document.querySelector(selector);
+    if (node) node.textContent = count;
+  }
+}
+
 function renderAdminPanel(arrivals) {
   if (activeAdminTab === 'prizes') return renderPrizePanel();
+  if (activeAdminTab === 'settings') return state.hasSettingsAccess ? renderSettingsPanel() : renderSettingsUnlockPanel();
   if (activeAdminTab === 'exports') return renderExportPanel();
   return renderCheckinPanel(arrivals);
 }
@@ -1844,23 +1877,34 @@ async function changeFixedWinner(editor, attendeeId, add) {
   }
 }
 
-function renderSettingsPage() {
-  app.innerHTML = `
-    <main class="settings-page">
-      <header class="settings-header">
-        <h1>大屏设置</h1>
-        <nav class="toolbar" aria-label="后台与大屏">
-          <a class="button-link secondary" href="/admin">${screenIcon('arrow-left')}后台</a>
-          <a class="button-link secondary" href="/screen/checkin">签到大屏</a>
-          <a class="button-link secondary" href="/screen/lottery">抽奖大屏</a>
-          <button type="button" class="secondary" id="logoutButton">退出设置</button>
-        </nav>
-      </header>
-      ${renderSettingsPanel()}
-    </main>`;
-  document.querySelector('#settingsForm').addEventListener('submit', saveSettings);
-  bindLogout('settings');
-  window.lucide?.createIcons();
+function renderSettingsUnlockPanel() {
+  return `<section class="panel">
+    <div class="panel-title"><h2>大屏设置</h2></div>
+    <form id="settingsUnlockForm" class="form-grid settings-unlock-form">
+      <label>大屏设置密码<input name="settingsPassword" type="password" autocomplete="current-password" required /></label>
+      <div class="toolbar"><button type="submit">${screenIcon('lock-keyhole-open')}解锁设置</button></div>
+      <div id="settingsUnlockError" class="error-text" role="alert"></div>
+    </form>
+  </section>`;
+}
+
+async function unlockSettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  const error = form.querySelector('#settingsUnlockError');
+  button.disabled = true;
+  error.textContent = '';
+  try {
+    await api('/api/login', { method: 'POST', body: { role: 'settings', password: form.elements.settingsPassword.value } });
+    await refreshState();
+    if (window.location.pathname === '/admin' && activeAdminTab === 'settings') renderAdmin();
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function modeOption(value, label, current) {
@@ -1871,7 +1915,10 @@ function renderSettingsPanel() {
   const config = state.config || {};
   return `
     <section class="panel">
-      <div class="panel-title"><h2>页面设置</h2></div>
+      <div class="panel-title">
+        <h2>大屏设置</h2>
+        <button type="button" class="secondary" id="lockSettingsButton">${screenIcon('lock-keyhole')}锁定设置</button>
+      </div>
       <form id="settingsForm" class="form-grid">
         <div class="grid-2">
           <label>活动标题<input name="eventTitle" value="${escapeHtml(config.eventTitle || '')}" /></label>
@@ -1983,6 +2030,17 @@ function renderExportPanel() {
 }
 
 function bindAdminEvents() {
+  document.querySelector('#settingsUnlockForm')?.addEventListener('submit', unlockSettings);
+  document.querySelector('#settingsForm')?.addEventListener('submit', saveSettings);
+  document.querySelector('#lockSettingsButton')?.addEventListener('click', async () => {
+    try {
+      await api('/api/logout', { method: 'POST', body: { role: 'settings' } });
+      state.hasSettingsAccess = false;
+      if (window.location.pathname === '/admin' && activeAdminTab === 'settings') renderAdmin();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
   document.querySelector('#toggleCheckinButton')?.addEventListener('click', async () => {
     if (pendingCheckinStatus) return;
     pendingCheckinStatus = true;

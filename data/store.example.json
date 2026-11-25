@@ -9,7 +9,7 @@
     "theme": "celebration",
     "checkinMode": "local",
     "checkinEnabled": true,
-    "wallMode": "sphere",
+    "wallMode": "orbit",
     "wallText": "LUCKY",
     "allowRepeatWinners": false,
     "companies": [

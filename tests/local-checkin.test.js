@@ -17,6 +17,86 @@ before(async () => {
 });
 after(async () => { await server?.stop(); });
 
+test('the legacy settings URL opens the embedded admin settings tab', async () => {
+  const response = await fetch(server.url + '/screen/settings', { redirect: 'manual' });
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), '/admin?tab=settings');
+});
+
+test('reset and demo insertion require admin access and can replace records with exactly four demos', async () => {
+  const isolated = await startTestServer();
+  try {
+    const call = (route, body, cookie) => fetch(isolated.url + route, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify(body)
+    });
+    const admin = (await call('/api/login', { role: 'admin', password: 'admin123' })).headers.getSetCookie()[0].split(';')[0];
+    const screen = (await call('/api/login', { role: 'screen', password: 'screen123' })).headers.getSetCookie()[0].split(';')[0];
+    const read = async () => (await fetch(isolated.url + '/api/state', { headers: { Cookie: admin } })).json();
+    for (const route of ['/api/reset', '/api/demo/seed']) {
+      assert.equal((await call(route, { scope: 'attendees', count: 4 })).status, 401);
+      assert.equal((await call(route, { scope: 'attendees', count: 4 }, screen)).status, 403);
+    }
+    await call('/api/demo/seed', {}, admin);
+    const before = await read();
+    assert.equal(before.attendees.length, 18);
+    await call('/api/draw', { prizeId: before.prizes[0].id, count: 1 }, admin);
+    assert.equal((await read()).winners.length, 1);
+    assert.equal((await call('/api/reset', { scope: 'attendees' }, admin)).status, 200);
+    const empty = await read();
+    assert.equal(empty.attendees.length, 0);
+    assert.equal(empty.winners.length, 0);
+    assert.deepEqual(empty.config, before.config);
+    assert.deepEqual(empty.prizes, before.prizes);
+    const seeded = await call('/api/demo/seed', { count: 4 }, admin);
+    assert.equal((await seeded.json()).count, 4);
+    const after = await read();
+    assert.equal(after.attendees.length, 4);
+    assert.equal(after.winners.length, 0);
+    assert.ok(after.attendees.every((item) => item.source === 'demo' && item.avatar.startsWith('data:image/svg+xml')));
+    assert.equal((await (await call('/api/demo/seed', { count: 4 }, admin)).json()).count, 0);
+    assert.equal((await read()).attendees.length, 4);
+  } finally {
+    await isolated.stop();
+  }
+});
+
+test('company presets are public, validated on submission and preserved when a historical unit is removed', async () => {
+  const isolated = await startTestServer({ env: { SETTINGS_PASSWORD: 'settings123' } });
+  try {
+    const call = async (route, body, cookie, method = 'POST') => {
+      const response = await fetch(isolated.url + route, {
+        method, headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify(body)
+      });
+      return { response, body: await response.json(), cookie: response.headers.getSetCookie()[0]?.split(';')[0] };
+    };
+    const settings = (await call('/api/login', { role: 'settings', password: 'settings123' })).cookie;
+    await call('/api/config', { companies: ['  研发部  ', '', '研发部', '市场部', null] }, settings, 'PUT');
+    const anonymous = await (await fetch(isolated.url + '/api/state')).json();
+    assert.deepEqual(anonymous.config.companies, ['研发部', '市场部']);
+    assert.equal(anonymous.config.adminPassword, undefined);
+    assert.deepEqual(anonymous.attendees, []);
+    const first = await call('/api/checkin', { name: '单位来宾', phone: '13800138000', company: '研发部' });
+    assert.equal(first.response.status, 200);
+    assert.equal(first.body.attendee.company, '研发部');
+    for (const company of ['不存在的单位', [], null, { name: '研发部' }]) {
+      const invalid = await call('/api/checkin', { name: '伪造单位', phone: '13800138000', company }, first.cookie);
+      assert.equal(invalid.response.status, 400);
+      assert.equal(invalid.body.code, 'COMPANY_OPTIONS_CHANGED');
+    }
+    await call('/api/config', { companies: ['市场部'] }, settings, 'PUT');
+    const kept = await call('/api/checkin', { name: '保留单位', phone: '13800138000', company: '研发部' }, first.cookie);
+    assert.equal(kept.response.status, 200);
+    assert.equal(kept.body.attendee.id, first.body.attendee.id);
+    assert.equal(kept.body.attendee.company, '研发部');
+    const changed = await call('/api/checkin', { name: '更换单位', phone: '13800138000', company: '市场部' }, first.cookie);
+    assert.equal(changed.body.attendee.company, '市场部');
+    await call('/api/config', { companies: [] }, settings, 'PUT');
+    assert.equal((await call('/api/checkin', { name: '无预设来宾', phone: '13900139000' })).response.status, 200);
+  } finally {
+    await isolated.stop();
+  }
+});
+
 async function json(url, body, method = 'POST', cookie) {
   const response = await fetch(server.url + url, {
     method, headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify(body)
@@ -140,10 +220,10 @@ test('two guests with the same name are not merged', async () => {
 });
 
 test('profile edits retain the company and the owner can read their own phone', async () => {
-  const first = await checkin({ name: '历史来宾', phone: '+1 415 555 0123', company: '测试单位' });
+  const first = await checkin({ name: '历史来宾', phone: '+1 415 555 0123', company: '技术部' });
   const result = await checkin({ name: '历史来宾新名', phone: '+1 415 555 0123' }, first.cookie);
   assert.equal(result.body.attendee.phone, '+14155550123');
-  assert.equal(result.body.attendee.company, '测试单位');
+  assert.equal(result.body.attendee.company, '技术部');
   assert.equal((await state(first.cookie)).selfAttendee.phone, '+14155550123');
   assert.ok(!(await state('')).attendees.length);
   assert.equal((await state('')).selfAttendee, null);

@@ -118,24 +118,59 @@ test('QR saves use the limited layout endpoint and restore the layout after a fa
   assert.equal(ui.run('qrSaving'), false);
 });
 
-test('the separate settings route requires its own session', () => {
-  const ui = browser('/screen/settings');
-  ui.run(`state.loginDefaults = { admin: true };`);
+test('settings stay inside the admin shell and unlock with a separate password', () => {
+  const ui = browser('/admin');
+  ui.run(`state.accessRole = 'admin'; activeAdminTab = 'settings';`);
   ui.context.render();
-  assert.match(ui.app.innerHTML, /进入大屏设置/);
-  assert.doesNotMatch(ui.app.innerHTML, /id="settingsForm"|value="admin123"|data-role="screen"/);
-  ui.selectors.set('#settingsForm', { addEventListener() {} });
-  ui.run(`state.accessRole = 'admin';`);
-  ui.context.render();
+  assert.match(ui.app.innerHTML, /class="admin-shell"/);
+  assert.match(ui.app.innerHTML, /data-tab="settings" class="active"/);
+  assert.match(ui.app.innerHTML, /id="settingsUnlockForm"/);
   assert.match(ui.app.innerHTML, /大屏设置密码/);
-  assert.doesNotMatch(ui.app.innerHTML, /id="settingsForm"/);
-  ui.run(`state.accessRole = null; state.hasSettingsAccess = true;`);
+  assert.doesNotMatch(ui.app.innerHTML, /id="settingsForm"|href="\/screen\/settings"/);
+  ui.run(`state.hasSettingsAccess = true;`);
   ui.context.render();
   assert.match(ui.app.innerHTML, /id="settingsForm"/);
   assert.match(ui.app.innerHTML, /name="qrSize"/);
   assert.match(ui.app.innerHTML, /name="logoX"/);
-  assert.match(ui.app.innerHTML, /退出设置/);
-  assert.doesNotMatch(ui.app.innerHTML, /name="adminPassword"/);
+  assert.match(ui.app.innerHTML, /锁定设置/);
+  assert.doesNotMatch(ui.app.innerHTML, /class="settings-page"|href="\/screen\/settings"/);
+});
+
+test('live sign-ins update admin counts without replacing the settings draft', () => {
+  const ui = browser('/admin');
+  ui.run(`state.accessRole = 'admin'; state.hasSettingsAccess = true; activeAdminTab = 'settings';`);
+  ui.context.render();
+  const original = ui.app.innerHTML;
+  const draft = { innerHTML: 'Unsaved settings' };
+  const count = { textContent: '3' };
+  ui.selectors.set('#adminPanel', draft);
+  ui.selectors.set('#adminCheckinCount', count);
+  ui.context.connectSocket();
+  const next = ui.run(`({ ...state, attendees: [...state.attendees, { id: 'new', name: '新签到' }] })`);
+  ui.events.get('state')(next);
+  assert.equal(ui.app.innerHTML, original);
+  assert.equal(draft.innerHTML, 'Unsaved settings');
+  assert.equal(count.textContent, 4);
+  assert.equal(ui.run('state.attendees.length'), 4);
+});
+
+test('screen branding is empty by default but still supports an uploaded logo', () => {
+  for (const pathname of ['/screen/checkin', '/screen/lottery']) {
+    const ui = browser(pathname);
+    ui.context.render();
+    assert.doesNotMatch(ui.app.innerHTML, /class="screen-logo"|class="brand-mark"|活动现场/);
+    ui.run(`state.config.logoUrl = '/uploads/logo-test.png';`);
+    ui.context.render();
+    assert.match(ui.app.innerHTML, /src="\/uploads\/logo-test.png" alt="活动 Logo"/);
+    assert.doesNotMatch(ui.app.innerHTML, /class="brand-mark"|活动现场/);
+  }
+});
+
+test('the winner presentation never labels a fixed winner', () => {
+  const ui = browser();
+  ui.context.showWinnerModal({ name: '一等奖' }, [{ name: '嘉宾甲', nickname: 'kiki', fixed: true }]);
+  assert.match(ui.masks[0].innerHTML, /嘉宾甲/);
+  assert.doesNotMatch(ui.masks[0].innerHTML, /内定|winner-fixed/);
 });
 
 test('only new arrivals animate, both in the live check-in list and the admin table', () => {
@@ -170,6 +205,47 @@ test('the check-in sphere projects rotating avatars with depth', () => {
   assert.ok(front.opacity > back.opacity);
   assert.ok(front.depth > back.depth);
   assert.ok(front.scale > 1.5 && back.scale < 0.8);
+});
+
+test('check-in defaults to orbit without switching modes at participant-count thresholds', () => {
+  const ui = browser('/screen/checkin');
+  for (const count of [0, 1, 4, 35, 36, 200, 520]) {
+    assert.equal(ui.context.getVisualWallMode(undefined, count), 'orbit');
+    assert.equal(ui.context.getVisualWallMode('invalid', count), 'orbit');
+    for (const mode of ['orbit', 'sphere', 'wall', 'text']) assert.equal(ui.context.getVisualWallMode(mode, count), mode);
+  }
+});
+
+test('the default orbit keeps scheduling rotation frames for one, four and many attendees', () => {
+  for (const count of [1, 4, 36, 200]) {
+    const ui = browser('/screen/checkin');
+    const classes = new Set();
+    const frames = [];
+    const nodes = Array.from({ length: count }, () => ({ style: {} }));
+    ui.context.window.matchMedia = () => ({ matches: true });
+    ui.context.window.requestAnimationFrame = (callback) => { frames.push(callback); return frames.length; };
+    ui.context.window.cancelAnimationFrame = () => {};
+    ui.selectors.set('#avatarStage', {
+      clientWidth: 1280, clientHeight: 720,
+      classList: {
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name)
+      },
+      style: { setProperty() {} },
+      querySelectorAll: () => nodes
+    });
+    ui.run(`state.attendees = Array.from({ length: ${count} }, (_, index) => ({ id: String(index), name: '测试嘉宾' }));`);
+    ui.context.paintAvatarStage();
+    assert.ok(classes.has('orbit'));
+    assert.ok(classes.has('is-spatial'));
+    assert.equal(frames.length, 1);
+    const initial = nodes.map((node) => node.style.transform);
+    frames.shift()(5000);
+    assert.equal(frames.length, 1);
+    assert.ok(nodes.some((node, index) => node.style.transform !== initial[index]));
+    assert.equal(ui.run('state.attendees.length'), count);
+  }
 });
 
 test('a spherical draw uses the selected prize animation instead of the check-in wall layout', () => {

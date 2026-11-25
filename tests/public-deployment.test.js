@@ -113,6 +113,7 @@ test('anonymous access exposes only activity information and cannot manage the e
   assert.equal(data.deployment, 'public');
   assert.equal(data.checkinUrl, origin + '/checkin');
   assert.equal(data.config.checkinMode, 'wechat');
+  assert.deepEqual(data.config.companies, ['总部', '市场部', '销售部', '技术部', '合作伙伴']);
   assert.deepEqual(data.wechat, { ready: true, profile: null });
   assert.equal(data.accessRole, null);
   assert.deepEqual(data.attendees, []);
@@ -164,7 +165,7 @@ test('the confirmed name and phone are saved with the verified avatar', async ()
     assert.equal((await request('/api/checkin', { method: 'POST', cookie: guestCookie, body: { name: '测试来宾', phone } })).status, 400);
   }
   const saved = await request('/api/checkin', { method: 'POST', cookie: guestCookie, body: {
-    name: '测试来宾', nickname: '伪造昵称', avatar: 'https://example.test/forged.png', phone: '13800138000', openid: 'spoof', source: 'local-form'
+    name: '测试来宾', nickname: '伪造昵称', avatar: 'https://example.test/forged.png', phone: '13800138000', company: '总部', openid: 'spoof', source: 'local-form'
   } });
   assert.equal(saved.status, 200);
   const attendee = (await saved.json()).attendee;
@@ -173,6 +174,7 @@ test('the confirmed name and phone are saved with the verified avatar', async ()
   assert.equal(attendee.nickname, '微信测试昵称');
   assert.equal(attendee.openid, undefined);
   assert.equal(attendee.phone, '13800138000');
+  assert.equal(attendee.company, '总部');
 
   const ownerState = await (await request('/api/state', { cookie: guestCookie })).json();
   assert.equal(ownerState.selfAttendee.id, guestId);
@@ -183,12 +185,19 @@ test('the confirmed name and phone are saved with the verified avatar', async ()
   assert.equal(anonymous.wechat.profile, null);
   assert.doesNotMatch(JSON.stringify(ownerState), /test-openid|test-token|test-app-secret/);
   const authorizedAgain = await authorize('again');
-  const edited = await request('/api/checkin', { method: 'POST', cookie: authorizedAgain, body: { name: '修改姓名', phone: '13900139000' } });
+  const edited = await request('/api/checkin', { method: 'POST', cookie: authorizedAgain, body: { name: '修改姓名', phone: '13900139000', company: '技术部' } });
   const result = await edited.json();
   assert.equal(result.existing, true);
   assert.equal(result.attendee.id, guestId);
   assert.equal(result.attendee.checkedInAt, attendee.checkedInAt);
   assert.equal(result.attendee.phone, '13900139000');
+  assert.equal(result.attendee.company, '技术部');
+  const invalid = await request('/api/checkin', { method: 'POST', cookie: authorizedAgain, body: { name: '伪造单位', phone: '13900139000', company: '任意填写的单位' } });
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).code, 'COMPANY_OPTIONS_CHANGED');
+  const unchanged = await (await request('/api/state', { cookie: authorizedAgain })).json();
+  assert.equal(unchanged.selfAttendee.company, '技术部');
+  assert.equal(unchanged.selfAttendee.name, '修改姓名');
 });
 
 test('staff sessions are server-side and role permissions are distinct', async () => {
